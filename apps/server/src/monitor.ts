@@ -3,6 +3,7 @@ import { config } from './config.js'
 import { PriceDetector } from './detector.js'
 import { CANDLE_SECONDS, createGateMarketClient, findQualifiedMarkets, type QualifiedMarket } from './market.js'
 import { GateTickerStream } from './ticker-stream.js'
+import { formatDateTime } from './time.js'
 
 export class GateMonitor {
   private readonly rest = createGateMarketClient()
@@ -49,7 +50,7 @@ export class GateMonitor {
       const next = await findQualifiedMarkets(this.rest, config.minTurnover, boundary, this.qualified)
       if (this.stopped) return
       await this.applyQualified(next)
-      this.refreshedAt = new Date().toISOString()
+      this.refreshedAt = formatDateTime(Date.now())
       this.lastError = null
       console.info(`[交易对刷新] ${this.refreshedAt} 符合条件 ${next.size} 个`)
       this.scheduleRefresh(false)
