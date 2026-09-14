@@ -1,29 +1,27 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useState } from 'react'
 
-type Health = { status: string };
+type Health = { status: string }
 
 export default function App() {
-  const [message, setMessage] = useState('正在连接服务端…');
+  const [message, setMessage] = useState('正在连接服务端…')
 
   useEffect(() => {
-    const controller = new AbortController();
+    const controller = new AbortController()
 
     fetch('/api/health', { signal: controller.signal })
-      .then((response) => {
-        if (!response.ok) throw new Error('服务端响应异常');
-        return response.json() as Promise<Health>;
+      .then(response => {
+        if (!response.ok) throw new Error('服务端响应异常')
+        return response.json() as Promise<Health>
       })
-      .then((data) =>
-        setMessage(data.status === 'ok' ? '服务端连接正常' : '服务端响应异常'),
-      )
+      .then(data => setMessage(data.status === 'ok' ? '服务端连接正常' : '服务端响应异常'))
       .catch((error: unknown) => {
-        if (error instanceof Error && error.name === 'AbortError') return;
-        setMessage('无法连接服务端');
-      });
+        if (error instanceof Error && error.name === 'AbortError') return
+        setMessage('无法连接服务端')
+      })
 
     // 卸载时取消请求，避免开发模式重复挂载产生过期状态更新。
-    return () => controller.abort();
-  }, []);
+    return () => controller.abort()
+  }, [])
 
   return (
     <main className="page">
@@ -37,5 +35,5 @@ export default function App() {
         </div>
       </div>
     </main>
-  );
+  )
 }
