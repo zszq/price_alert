@@ -4,6 +4,7 @@ import { formatDateTime } from './time.js'
 
 let lastSoundAt = 0
 
+/** 将异动格式化后输出，并尽可能通过终端或系统蜂鸣提醒当前用户。 */
 export function announce(alert: Alert): void {
   const change = `${alert.change >= 0 ? '+' : ''}${(alert.change * 100).toFixed(2)}%`
   const threshold = `${(alert.threshold * 100).toFixed(2)}%`
@@ -26,6 +27,7 @@ export function announce(alert: Alert): void {
       windowsHide: true,
     })
     sound.on('error', error => console.error('[提示音失败]', error))
+    // 蜂鸣只是附加提醒，不应阻止服务端在收到退出信号后结束进程。
     sound.unref()
   }
 }

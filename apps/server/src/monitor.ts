@@ -17,6 +17,7 @@ export class GateMonitor {
   private refreshedAt: string | null = null
   private lastError: string | null = null
 
+  /** 返回面向健康检查的轻量快照，不暴露连接对象和内部价格数据。 */
   status() {
     return {
       state: this.stopped ? 'stopped' : this.lastError ? 'degraded' : this.refreshedAt ? 'active' : 'initializing',
@@ -26,11 +27,13 @@ export class GateMonitor {
     }
   }
 
+  /** 启动固定频率采样，并立即进行首次市场筛选和订阅。 */
   start(): void {
     this.sampleTimer = setInterval(() => this.samplePrices(), config.sampleMs)
     void this.refresh()
   }
 
+  /** 停止所有定时任务，并等待 REST 与 WebSocket 连接完成清理。 */
   async stop(): Promise<void> {
     this.stopped = true
     if (this.refreshTimer) clearTimeout(this.refreshTimer)
@@ -38,9 +41,11 @@ export class GateMonitor {
     await Promise.allSettled([this.tickerStream.stop(), this.rest.close()])
   }
 
+  /** 刷新符合成交额门槛的市场；失败时保留当前订阅并进入快速重试。 */
   private async refresh(): Promise<void> {
     if (this.stopped) return
     try {
+      // 市场元数据变化远慢于成交额，按小时强制刷新可减少无意义的全量请求。
       if (!this.marketsLoadedAt || Date.now() - this.marketsLoadedAt >= 60 * 60_000) {
         await this.rest.loadMarkets(true)
         this.marketsLoadedAt = Date.now()
@@ -70,6 +75,7 @@ export class GateMonitor {
     this.refreshTimer = setTimeout(() => void this.refresh(), retry ? 30_000 : nextBoundary - now)
   }
 
+  /** 根据刷新结果原子式切换订阅，并清理退出名单的检测状态。 */
   private async applyQualified(next: Map<string, QualifiedMarket>): Promise<void> {
     const before = [...this.qualified.keys()].sort()
     const after = [...next.keys()].sort()
@@ -90,6 +96,7 @@ export class GateMonitor {
     }
   }
 
+  /** 从最新行情缓存取样；过期价格不参与计算，等待 WebSocket 恢复后再继续。 */
   private samplePrices(): void {
     const now = Date.now()
     for (const [symbol, market] of this.qualified) {

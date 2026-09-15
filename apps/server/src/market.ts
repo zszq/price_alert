@@ -43,6 +43,7 @@ export function sumTwelveHours(candles: GateCandle[], boundarySeconds: number): 
   return seen.size > 0 ? turnover : null
 }
 
+/** 并发核验候选合约最近 12 小时的成交额，并在单品种请求失败时保留旧结果。 */
 export async function findQualifiedMarkets(
   exchange: InstanceType<typeof ccxt.gate>,
   minTurnover: number,
@@ -63,6 +64,7 @@ export async function findQualifiedMarkets(
   })
   const result = new Map<string, QualifiedMarket>()
   const concurrency = 4
+  // JavaScript 在两个 await 之间同步执行，因此多个 worker 可安全领取不同的数组下标。
   let cursor = 0
 
   await Promise.all(

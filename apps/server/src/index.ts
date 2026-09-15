@@ -14,6 +14,7 @@ const server = app.listen(port, () => {
   monitor.start()
 })
 
+// 先停止接收新请求，再释放行情连接；无论清理是否报错都要响应系统退出信号。
 for (const signal of ['SIGINT', 'SIGTERM'] as const) {
   process.once(signal, () => {
     server.close()

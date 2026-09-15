@@ -1,3 +1,4 @@
+/** 读取必须大于零的数值配置，让错误环境变量在启动阶段尽早暴露。 */
 function positiveNumber(name: string, fallback: number): number {
   const raw = process.env[name]
   if (raw === undefined) return fallback
@@ -7,6 +8,7 @@ function positiveNumber(name: string, fallback: number): number {
   return value
 }
 
+// 百分比配置统一转换为小数，时间配置统一转换为毫秒，供检测器直接参与计算。
 export const config = {
   minTurnover: positiveNumber('MIN_12H_TURNOVER_USDT', 10_000_000),
   sampleMs: 5_000,

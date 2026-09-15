@@ -17,6 +17,7 @@ type State = { samples: Sample[]; lastAlert: Map<string, number> }
 export class PriceDetector {
   private readonly states = new Map<string, State>()
 
+  /** 清除已退订交易对的历史样本和冷却状态，防止重新订阅时沿用过期基线。 */
   remove(symbol: string): void {
     this.states.delete(symbol)
   }
@@ -54,6 +55,7 @@ export class PriceDetector {
       const threshold = Math.max(option.floor, Math.expm1(dynamic))
       if (Math.abs(change) < threshold) continue
       const direction = change > 0 ? '上涨' : '下跌'
+      // 同方向的 1 分钟和 5 分钟报警共用冷却，避免同一次行情异动连续提醒。
       const key = direction
       if (time - (state.lastAlert.get(key) ?? -Infinity) < config.cooldownMs) continue
       state.lastAlert.set(key, time)
@@ -62,11 +64,13 @@ export class PriceDetector {
     }
 
     samples.push({ time, price })
+    // 120 个五秒收益率约需十分钟历史；多保留一分钟以吸收采样漂移和边界容差。
     while (samples.length && samples[0].time < time - 11 * 60_000) samples.shift()
     return alert
   }
 }
 
+/** 计算总体标准差；这里的完整历史窗口就是总体，不需要样本自由度修正。 */
 function standardDeviation(values: number[]): number {
   const mean = values.reduce((sum, value) => sum + value, 0) / values.length
   const variance = values.reduce((sum, value) => sum + (value - mean) ** 2, 0) / values.length

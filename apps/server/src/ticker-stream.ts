@@ -11,6 +11,7 @@ export class GateTickerStream {
 
   constructor(private readonly markets: InstanceType<typeof ccxt.gate>) {}
 
+  /** 用新交易对集合整体替换订阅；Gate 无法可靠退订，因此通过重建连接实现。 */
   async replace(symbols: string[]): Promise<void> {
     // 代次用于丢弃旧连接关闭过程中迟到的消息，避免已剔除交易对重新写入价格缓存。
     this.generation++
@@ -36,6 +37,7 @@ export class GateTickerStream {
     }
   }
 
+  /** 使所有读取循环失效，并关闭当前 WebSocket。 */
   async stop(): Promise<void> {
     this.stopped = true
     this.generation++
@@ -43,6 +45,7 @@ export class GateTickerStream {
     this.socket = null
   }
 
+  /** 持续消费一批 ticker；仅当前代次允许写入共享价格缓存。 */
   private async watchChunk(socket: GateSocket, symbols: string[], generation: number): Promise<void> {
     while (!this.stopped && generation === this.generation) {
       try {
@@ -58,6 +61,7 @@ export class GateTickerStream {
       } catch (error) {
         if (this.stopped || generation !== this.generation) return
         console.error(`[行情连接异常] ${symbols[0]} 等 ${symbols.length} 个交易对，5 秒后重试`, error)
+        // 网络故障时退避，避免立即重连形成高频错误循环并触发交易所限流。
         await new Promise(resolve => setTimeout(resolve, 5_000))
       }
     }

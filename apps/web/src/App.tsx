@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 
 type Health = { status: string }
 
+/** 展示最小可用的前端状态，并在挂载时验证反向代理到服务端的链路。 */
 export default function App() {
   const [message, setMessage] = useState('正在连接服务端…')
 
