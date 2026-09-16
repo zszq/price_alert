@@ -1,6 +1,0 @@
-packages:
-  - apps/*
-allowBuilds:
-  bufferutil: false
-  ccxt: false
-  esbuild: true

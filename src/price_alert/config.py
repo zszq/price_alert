@@ -1,0 +1,81 @@
+"""YAML 配置读取与严格校验。"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Literal
+
+import yaml
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+
+class GateConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    rest_url: str = "https://api.gateio.ws/api/v4"
+    websocket_url: str = "wss://fx-ws.gateio.ws/v4/ws/usdt"
+    settle: Literal["usdt"] = "usdt"
+    min_volume_24h_quote: float = Field(default=10_000_000, gt=0)
+    universe_refresh_seconds: int = Field(default=600, ge=60, le=86400)
+    rest_timeout_seconds: float = Field(default=15.0, gt=0, le=60)
+    rest_retries: int = Field(default=3, ge=1, le=10)
+    warmup_concurrency: int = Field(default=8, ge=1, le=32)
+    subscription_chunk_size: int = Field(default=100, ge=1, le=500)
+    receive_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    reconnect_initial_seconds: float = Field(default=1.0, gt=0, le=60)
+    reconnect_max_seconds: float = Field(default=30.0, gt=0, le=300)
+    status_interval_seconds: int = Field(default=60, gt=0, le=3600)
+
+
+class IndicatorConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    candle_interval: Literal["1m", "5m", "15m"] = "1m"
+    atr_period: int = Field(default=14, ge=2, le=200)
+    warmup_candles: int = Field(default=50, ge=15, le=500)
+    lookback_seconds: int = Field(default=30, ge=5, le=3600)
+    trigger_atr_multiple: float = Field(default=0.8, gt=0, le=20)
+    min_window_trades: int = Field(default=5, ge=1)
+    max_atr_age_seconds: int = Field(default=180, ge=30, le=3600)
+
+    @model_validator(mode="after")
+    def validate_warmup_and_freshness(self) -> IndicatorConfig:
+        if self.warmup_candles <= self.atr_period:
+            raise ValueError("warmup_candles 必须大于 atr_period，以便排除尚未收盘的 K 线")
+        interval_seconds = {"1m": 60, "5m": 300, "15m": 900}[self.candle_interval]
+        if self.max_atr_age_seconds < interval_seconds * 2:
+            raise ValueError("max_atr_age_seconds 不能小于两个 K 线周期")
+        return self
+
+
+class AlertConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    cooldown_seconds: int = Field(default=120, ge=0, le=86400)
+    console: bool = True
+    console_colors: bool = True
+    beep: bool = True
+    jsonl_path: Path | None = Path("data/alerts/alerts.jsonl")
+    webhook_url: str | None = None
+    webhook_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
+
+
+class AppConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    gate: GateConfig = Field(default_factory=GateConfig)
+    indicator: IndicatorConfig = Field(default_factory=IndicatorConfig)
+    alerts: AlertConfig = Field(default_factory=AlertConfig)
+
+
+def load_config(path: str | Path) -> AppConfig:
+    source = Path(path)
+    raw = yaml.safe_load(source.read_text(encoding="utf-8")) or {}
+    config = AppConfig.model_validate(raw)
+
+    # Webhook 常包含密钥，环境变量覆盖可避免敏感地址进入配置文件。
+    webhook_url = os.getenv("PRICE_ALERT_WEBHOOK_URL")
+    if webhook_url:
+        config.alerts.webhook_url = webhook_url
+    return config

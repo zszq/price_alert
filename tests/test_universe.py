@@ -1,0 +1,57 @@
+from price_alert.universe import select_liquid_contracts
+
+
+def test_selects_only_usdt_contracts_strictly_above_quote_volume_threshold():
+    tickers = [
+        {"contract": "BTC_USDT", "last": "70000", "volume_24h_quote": "10000001"},
+        {"contract": "ETH_USDT", "last": "2000", "volume_24h_quote": "10000000"},
+        {"contract": "BTC_USD", "last": "70000", "volume_24h_quote": "999999999"},
+        {"contract": "BAD_USDT", "last": "0", "volume_24h_quote": "999999999"},
+    ]
+    contracts = [
+        {"name": "BTC_USDT", "contract_type": "", "status": "trading"},
+        {"name": "ETH_USDT", "contract_type": "", "status": "trading"},
+        {"name": "BTC_USD", "contract_type": "", "status": "trading"},
+        {"name": "BAD_USDT", "contract_type": "", "status": "trading"},
+    ]
+
+    selected = select_liquid_contracts(tickers, contracts, 10_000_000)
+
+    assert [item.symbol for item in selected] == ["BTC_USDT"]
+
+
+def test_uses_deprecated_usd_volume_only_as_fallback():
+    selected = select_liquid_contracts(
+        [{"contract": "SOL_USDT", "last": "100", "volume_24h_usd": "20000000"}],
+        [{"name": "SOL_USDT", "contract_type": "", "status": "trading"}],
+        10_000_000,
+    )
+    assert selected[0].volume_24h_quote == 20_000_000
+
+
+def test_excludes_non_crypto_and_non_trading_contracts():
+    tickers = [
+        {"contract": symbol, "last": "100", "volume_24h_quote": "20000000"}
+        for symbol in ("BTC_USDT", "OPENAI_USDT", "XAU_USDT", "EUR_USDT", "OLD_USDT")
+    ]
+    contracts = [
+        {"name": "BTC_USDT", "contract_type": "", "status": "trading"},
+        {"name": "OPENAI_USDT", "contract_type": "stocks", "status": "trading"},
+        {"name": "XAU_USDT", "contract_type": "metals", "status": "trading"},
+        {"name": "EUR_USDT", "contract_type": "forex", "status": "trading"},
+        {"name": "OLD_USDT", "contract_type": "", "status": "delisting"},
+    ]
+
+    selected = select_liquid_contracts(tickers, contracts, 10_000_000)
+
+    assert [item.symbol for item in selected] == ["BTC_USDT"]
+
+
+def test_excludes_contract_when_classification_is_missing():
+    selected = select_liquid_contracts(
+        [{"contract": "UNKNOWN_USDT", "last": "1", "volume_24h_quote": "20000000"}],
+        [{"name": "UNKNOWN_USDT", "status": "trading"}],
+        10_000_000,
+    )
+
+    assert selected == []

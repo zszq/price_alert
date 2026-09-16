@@ -1,0 +1,9 @@
+pydantic>=2.10,<3
+PyYAML>=6.0,<7
+websockets>=14,<17
+colorama>=0.4.6,<1
+
+# 开发与测试
+pytest>=8.3,<10
+pytest-cov>=6,<8
+ruff>=0.9,<1
