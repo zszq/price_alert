@@ -88,6 +88,8 @@ async def run_monitor(config: AppConfig) -> None:
         candle_interval_seconds=interval_seconds,
         lookback_seconds=config.indicator.lookback_seconds,
         trigger_atr_multiple=config.indicator.trigger_atr_multiple,
+        min_change_percent=config.indicator.min_change_percent,
+        confirmation_seconds=config.indicator.confirmation_seconds,
         min_window_trades=config.indicator.min_window_trades,
         max_atr_age_seconds=config.indicator.max_atr_age_seconds,
         cooldown_seconds=config.alerts.cooldown_seconds,

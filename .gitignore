@@ -18,3 +18,4 @@ dist/
 # 告警记录只保存在本机，避免行情事件与 Webhook 信息进入版本库。
 data/alerts/**
 !data/alerts/.gitkeep
+data/price-alert.lock

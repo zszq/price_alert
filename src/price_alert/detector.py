@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from typing import Literal
 
 from price_alert.indicators import WilderAtr
 from price_alert.models import Candle, PriceAlert, PriceTick
@@ -13,8 +14,24 @@ from price_alert.models import Candle, PriceAlert, PriceTick
 @dataclass(slots=True)
 class _SecondBucket:
     timestamp: datetime
-    close: float
-    trade_count: int = 1
+    weighted_price_sum: float = 0.0
+    total_size: float = 0.0
+    price_sum: float = 0.0
+    trade_count: int = 0
+
+    def add(self, price: float, size: float) -> None:
+        self.price_sum += price
+        self.trade_count += 1
+        if size > 0:
+            self.weighted_price_sum += price * size
+            self.total_size += size
+
+    @property
+    def price(self) -> float:
+        # 成交量加权能降低小额离群成交的影响；零成交量数据退化为普通均价。
+        if self.total_size > 0:
+            return self.weighted_price_sum / self.total_size
+        return self.price_sum / self.trade_count
 
 
 @dataclass(slots=True)
@@ -41,6 +58,9 @@ class _SymbolState:
     buckets: deque[_SecondBucket] = field(default_factory=deque)
     live_bar: _LiveBar | None = None
     last_tick_time: datetime | None = None
+    candidate_direction: Literal["surge", "drop"] | None = None
+    candidate_seconds: int = 0
+    candidate_last_second: datetime | None = None
 
 
 class AtrMoveDetector:
@@ -51,6 +71,8 @@ class AtrMoveDetector:
         candle_interval_seconds: int,
         lookback_seconds: int,
         trigger_atr_multiple: float,
+        min_change_percent: float,
+        confirmation_seconds: int,
         min_window_trades: int,
         max_atr_age_seconds: int,
         cooldown_seconds: int,
@@ -59,11 +81,13 @@ class AtrMoveDetector:
         self.candle_interval_seconds = candle_interval_seconds
         self.lookback_seconds = lookback_seconds
         self.trigger_atr_multiple = trigger_atr_multiple
+        self.min_change_percent = min_change_percent
+        self.confirmation_seconds = confirmation_seconds
         self.min_window_trades = min_window_trades
         self.max_atr_age = timedelta(seconds=max_atr_age_seconds)
         self.cooldown = timedelta(seconds=cooldown_seconds)
         self._states: dict[str, _SymbolState] = {}
-        self._last_alert: dict[tuple[str, str], datetime] = {}
+        self._last_alert: dict[str, datetime] = {}
 
     @property
     def symbols(self) -> list[str]:
@@ -83,7 +107,7 @@ class AtrMoveDetector:
         for symbol in symbols:
             self._states.pop(symbol, None)
         self._last_alert = {
-            key: timestamp for key, timestamp in self._last_alert.items() if key[0] not in symbols
+            symbol: timestamp for symbol, timestamp in self._last_alert.items() if symbol not in symbols
         }
 
     def add_tick(self, tick: PriceTick) -> list[PriceAlert]:
@@ -100,19 +124,23 @@ class AtrMoveDetector:
 
         second = timestamp.replace(microsecond=0)
         is_new_second = not state.buckets or state.buckets[-1].timestamp != second
-        if is_new_second:
-            state.buckets.append(_SecondBucket(second, tick.price))
-        else:
-            state.buckets[-1].close = tick.price
-            state.buckets[-1].trade_count += 1
+        if not is_new_second:
+            state.buckets[-1].add(tick.price, tick.size)
+            return []
 
-        oldest_required = second - timedelta(seconds=self.lookback_seconds)
-        while len(state.buckets) > 1 and state.buckets[1].timestamp <= oldest_required:
+        completed = state.buckets[-1] if state.buckets else None
+        current = _SecondBucket(second)
+        current.add(tick.price, tick.size)
+        state.buckets.append(current)
+        if completed is None:
+            return []
+
+        oldest_required = completed.timestamp - timedelta(seconds=self.lookback_seconds)
+        while len(state.buckets) > 2 and state.buckets[1].timestamp <= oldest_required:
             state.buckets.popleft()
 
-        if not is_new_second:
-            return []
-        alert = self._evaluate(tick.symbol.upper(), state, timestamp)
+        # 等一秒结束后再使用整秒 VWAP，避免把新一秒的第一笔成交误当成稳定价格。
+        alert = self._evaluate(tick.symbol.upper(), state, completed, timestamp)
         return [alert] if alert is not None else []
 
     def _update_bar(self, state: _SymbolState, price: float, timestamp: datetime) -> None:
@@ -132,21 +160,30 @@ class AtrMoveDetector:
         floored = epoch - (epoch % self.candle_interval_seconds)
         return datetime.fromtimestamp(floored, tz=UTC)
 
-    def _evaluate(self, symbol: str, state: _SymbolState, timestamp: datetime) -> PriceAlert | None:
+    def _evaluate(
+        self,
+        symbol: str,
+        state: _SymbolState,
+        current: _SecondBucket,
+        timestamp: datetime,
+    ) -> PriceAlert | None:
         atr = state.atr.value
         atr_timestamp = state.atr.last_timestamp
         if atr is None or atr <= 0 or atr_timestamp is None:
+            self._reset_candidate(state)
             return None
         if timestamp - atr_timestamp > self.max_atr_age:
+            self._reset_candidate(state)
             return None
 
-        current = state.buckets[-1]
         target = current.timestamp - timedelta(seconds=self.lookback_seconds)
         baseline = next((bucket for bucket in reversed(state.buckets) if bucket.timestamp <= target), None)
         if baseline is None:
+            self._reset_candidate(state)
             return None
         observed_seconds = (current.timestamp - baseline.timestamp).total_seconds()
         if observed_seconds > self.lookback_seconds + 2:
+            self._reset_candidate(state)
             return None
 
         trade_count = sum(
@@ -155,26 +192,34 @@ class AtrMoveDetector:
             if baseline.timestamp < bucket.timestamp <= current.timestamp
         )
         if trade_count < self.min_window_trades:
+            self._reset_candidate(state)
             return None
 
-        price_move = current.close - baseline.close
+        price_move = current.price - baseline.price
+        change_percent = price_move / baseline.price * 100.0
         move_atr = abs(price_move) / atr
-        if move_atr < self.trigger_atr_multiple:
+        # 两道门槛必须同时满足：百分比保证肉眼可感知，ATR 倍数适配不同市场波动率。
+        if abs(change_percent) < self.min_change_percent or move_atr < self.trigger_atr_multiple:
+            self._reset_candidate(state)
             return None
 
         direction = "surge" if price_move > 0 else "drop"
-        cooldown_key = (symbol, direction)
-        previous_alert = self._last_alert.get(cooldown_key)
-        if previous_alert is not None and timestamp - previous_alert < self.cooldown:
+        if not self._confirm_candidate(state, direction, current.timestamp):
             return None
-        self._last_alert[cooldown_key] = timestamp
+
+        previous_alert = self._last_alert.get(symbol)
+        if previous_alert is not None and timestamp - previous_alert < self.cooldown:
+            self._reset_candidate(state)
+            return None
+        self._last_alert[symbol] = timestamp
+        self._reset_candidate(state)
 
         return PriceAlert(
             symbol=symbol,
             direction=direction,
-            price=current.close,
-            reference_price=baseline.close,
-            change_percent=(current.close / baseline.close - 1.0) * 100.0,
+            price=current.price,
+            reference_price=baseline.price,
+            change_percent=change_percent,
             move_atr=move_atr,
             atr=atr,
             atr_period=self.atr_period,
@@ -183,3 +228,25 @@ class AtrMoveDetector:
             volume_24h_quote=state.volume_24h_quote,
             timestamp=timestamp,
         )
+
+    def _confirm_candidate(
+        self,
+        state: _SymbolState,
+        direction: Literal["surge", "drop"],
+        second: datetime,
+    ) -> bool:
+        is_consecutive = (
+            state.candidate_direction == direction
+            and state.candidate_last_second is not None
+            and second - state.candidate_last_second == timedelta(seconds=1)
+        )
+        state.candidate_seconds = state.candidate_seconds + 1 if is_consecutive else 1
+        state.candidate_direction = direction
+        state.candidate_last_second = second
+        return state.candidate_seconds >= self.confirmation_seconds
+
+    @staticmethod
+    def _reset_candidate(state: _SymbolState) -> None:
+        state.candidate_direction = None
+        state.candidate_seconds = 0
+        state.candidate_last_second = None

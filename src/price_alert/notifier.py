@@ -7,6 +7,7 @@ import json
 import logging
 import urllib.request
 from collections.abc import Iterable
+from datetime import timedelta, timezone
 from pathlib import Path
 from typing import Protocol
 
@@ -16,6 +17,7 @@ from price_alert.config import AlertConfig
 from price_alert.models import PriceAlert
 
 LOGGER = logging.getLogger(__name__)
+BEIJING_TIME = timezone(timedelta(hours=8))
 
 
 class Notifier(Protocol):
@@ -24,11 +26,12 @@ class Notifier(Protocol):
 
 def format_alert(alert: PriceAlert) -> str:
     label = "暴涨" if alert.direction == "surge" else "暴跌"
+    move_label = "上涨" if alert.direction == "surge" else "下跌"
+    occurred_at = alert.timestamp.astimezone(BEIJING_TIME).strftime("%Y-%m-%d %H:%M:%S")
     return (
-        f"[{label}提醒] {alert.symbol} 在 {alert.lookback_seconds} 秒内 "
-        f"移动 {alert.move_atr:.2f} ATR（{alert.change_percent:+.2f}%）"
-        f" | {alert.reference_price:g} → {alert.price:g} | ATR({alert.atr_period})={alert.atr:g}"
-        f" | 24h成交额 {alert.volume_24h_quote / 1_000_000:.1f}M USDT"
+        f"[{label}提醒] {occurred_at} | {alert.symbol} | {alert.lookback_seconds}秒内价格{move_label} "
+        f"{abs(alert.change_percent):.2f}% | {alert.reference_price:g} → {alert.price:g}"
+        f" | 异动强度 {alert.move_atr:.2f} ATR"
     )
 
 

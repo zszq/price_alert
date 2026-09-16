@@ -30,7 +30,12 @@ def test_jsonl_notifier_writes_atr_alert(tmp_path):
     payload = json.loads(target.read_text(encoding="utf-8"))
     assert payload["move_atr"] == 1.25
     assert payload["color"] == "green"
-    assert "1.25 ATR" in format_alert(alert)
+    text = format_alert(alert)
+    assert "2026-01-01 08:00:00" in text
+    assert "价格上涨 1.00%" in text
+    assert "异动强度 1.25 ATR" in text
+    assert "ATR(14)=" not in text
+    assert "24h成交额" not in text
     assert colorize_alert(alert, "surge") == f"{Fore.GREEN}surge{Style.RESET_ALL}"
 
 
@@ -51,4 +56,5 @@ def test_drop_alert_is_red():
     )
 
     assert alert.to_dict()["color"] == "red"
+    assert "价格下跌 1.00%" in format_alert(alert)
     assert colorize_alert(alert, "drop") == f"{Fore.RED}drop{Style.RESET_ALL}"

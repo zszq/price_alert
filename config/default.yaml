@@ -18,7 +18,9 @@ indicator:
   atr_period: 14
   warmup_candles: 50
   lookback_seconds: 30
-  trigger_atr_multiple: 0.8
+  trigger_atr_multiple: 1.5
+  min_change_percent: 1.0
+  confirmation_seconds: 3
   min_window_trades: 5
   max_atr_age_seconds: 180
 

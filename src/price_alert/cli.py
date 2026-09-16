@@ -6,10 +6,12 @@ import argparse
 import asyncio
 import logging
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from price_alert.config import AppConfig, load_config
 from price_alert.detector import AtrMoveDetector
 from price_alert.gate import GateRestClient
+from price_alert.instance import AlreadyRunningError, ProcessLock
 from price_alert.models import Candle, PriceTick
 from price_alert.notifier import ConsoleNotifier
 from price_alert.service import INTERVAL_SECONDS, run_monitor
@@ -45,6 +47,8 @@ async def simulate(config: AppConfig) -> None:
         candle_interval_seconds=interval_seconds,
         lookback_seconds=indicator.lookback_seconds,
         trigger_atr_multiple=indicator.trigger_atr_multiple,
+        min_change_percent=indicator.min_change_percent,
+        confirmation_seconds=indicator.confirmation_seconds,
         min_window_trades=indicator.min_window_trades,
         max_atr_age_seconds=indicator.max_atr_age_seconds,
         cooldown_seconds=0,
@@ -57,16 +61,20 @@ async def simulate(config: AppConfig) -> None:
     for second in range(indicator.lookback_seconds + 1):
         detector.add_tick(PriceTick("BTC_USDT", 100.0, 1.0, now + timedelta(seconds=second), str(second)))
     atr = 2.0
-    moved_price = 100.0 + atr * indicator.trigger_atr_multiple * 1.1
-    alert_tick = PriceTick(
-        "BTC_USDT",
-        moved_price,
-        1.0,
-        now + timedelta(seconds=indicator.lookback_seconds + 1),
-        "demo",
-    )
-    for alert in detector.add_tick(alert_tick):
-        await notifier.send(alert)
+    atr_distance = atr * indicator.trigger_atr_multiple
+    percent_distance = 100.0 * indicator.min_change_percent / 100.0
+    moved_price = 100.0 + max(atr_distance, percent_distance) * 1.1
+    # 多送一秒用于结算最后一个确认桶，与真实行情的完整秒检测保持一致。
+    for offset in range(indicator.confirmation_seconds + 1):
+        alert_tick = PriceTick(
+            "BTC_USDT",
+            moved_price,
+            1.0,
+            now + timedelta(seconds=indicator.lookback_seconds + 1 + offset),
+            f"demo-{offset}",
+        )
+        for alert in detector.add_tick(alert_tick):
+            await notifier.send(alert)
 
 
 def print_universe(config: AppConfig) -> None:
@@ -94,7 +102,9 @@ def main() -> None:
     if args.command == "check-config":
         print(
             f"配置有效：Gate.io USDT 永续，成交额门槛 {config.gate.min_volume_24h_quote / 1_000_000:.1f}M，"
-            f"触发阈值 {config.indicator.trigger_atr_multiple:g} ATR"
+            f"触发阈值 {config.indicator.trigger_atr_multiple:g} ATR，"
+            f"最低涨跌 {config.indicator.min_change_percent:g}%，"
+            f"连续 {config.indicator.confirmation_seconds} 秒确认"
         )
         return
     if args.command == "universe":
@@ -104,7 +114,10 @@ def main() -> None:
         asyncio.run(simulate(config))
         return
     try:
-        asyncio.run(run_monitor(config))
+        with ProcessLock(Path("data/price-alert.lock")):
+            asyncio.run(run_monitor(config))
+    except AlreadyRunningError as exc:
+        raise SystemExit(str(exc)) from exc
     except KeyboardInterrupt:
         print("\n监控已停止")
 

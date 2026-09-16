@@ -29,3 +29,11 @@ alerts:
 def test_rejects_atr_configuration_without_enough_warmup_data():
     with pytest.raises(ValidationError, match="warmup_candles"):
         AppConfig.model_validate({"indicator": {"atr_period": 20, "warmup_candles": 20}})
+
+
+def test_noise_protection_defaults_are_enabled():
+    config = AppConfig()
+
+    assert config.indicator.trigger_atr_multiple == 1.5
+    assert config.indicator.min_change_percent == 1.0
+    assert config.indicator.confirmation_seconds == 3
