@@ -51,17 +51,22 @@ class ConsoleNotifier:
     def __init__(self, beep: bool = True, colors: bool = True) -> None:
         self.beep = beep
         self.colors = colors
+        # macOS 终端通常会忽略或禁用 ASCII 响铃，直接播放系统音效才能稳定发声。
+        self._system_sound = beep and sys.platform == "darwin"
+        # 持有引用，避免后台播放任务被垃圾回收，也用于判断上一次是否仍在播放。
+        self._sound_task: asyncio.Task[None] | None = None
         if colors:
             # Windows 控制台实现差异较大，初始化兼容层可避免直接显示转义字符。
             just_fix_windows_console()
 
     async def send(self, alert: PriceAlert) -> None:
         text = colorize_alert(alert, format_alert(alert), self.colors)
-        # macOS 终端通常会忽略或禁用 ASCII 响铃，直接播放系统音效才能稳定发声。
-        terminal_bell = "\a" if self.beep and sys.platform != "darwin" else ""
+        terminal_bell = "\a" if self.beep and not self._system_sound else ""
         print(terminal_bell + text, flush=True)
-        if self.beep and sys.platform == "darwin":
-            await self._play_macos_sound()
+        # 音效约 1.65 秒，等待播完会让集中异动时的文字提醒逐条排队延迟，所以放到后台；
+        # 上一次仍在播放时直接跳过，一波异动只响一次。
+        if self._system_sound and (self._sound_task is None or self._sound_task.done()):
+            self._sound_task = asyncio.create_task(self._play_macos_sound(), name="console-alert-sound")
 
     @staticmethod
     async def _play_macos_sound() -> None:
@@ -72,12 +77,20 @@ class ConsoleNotifier:
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )
-            return_code = await process.wait()
-            if return_code != 0:
-                LOGGER.warning("macOS 提示音播放失败，afplay 退出码：%s", return_code)
         except OSError as exc:
-            # 提示音失败不能吞掉已经输出的价格提醒，也不能中断该通知通道。
+            # 提示音只是附加提醒，文字已经输出，失败时只记日志。
             LOGGER.warning("macOS 提示音播放失败：%s", exc)
+            return
+        try:
+            return_code = await process.wait()
+        except asyncio.CancelledError:
+            # 退出时事件循环会取消后台任务；结束并回收子进程，避免 afplay 脱离事件循环后成为孤儿进程。
+            with contextlib.suppress(ProcessLookupError):
+                process.kill()
+            await process.wait()
+            raise
+        if return_code != 0:
+            LOGGER.warning("macOS 提示音播放失败，afplay 退出码：%s", return_code)
 
 
 class JsonlNotifier:

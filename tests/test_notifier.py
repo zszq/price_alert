@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import json
 from datetime import UTC, datetime
 
@@ -85,24 +86,105 @@ def make_alert(symbol: str = "BTC_USDT") -> PriceAlert:
     )
 
 
-def test_console_notifier_uses_afplay_on_macos(monkeypatch, capsys):
-    calls = []
+class FakeSoundProcess:
+    """可控制播放何时结束的 afplay 替身。"""
 
-    class Process:
-        async def wait(self):
-            return 0
+    def __init__(self, return_code: int = 0) -> None:
+        self.return_code = return_code
+        self.finished = asyncio.Event()
+        self.killed = False
+
+    async def wait(self) -> int:
+        await self.finished.wait()
+        return self.return_code
+
+    def kill(self) -> None:
+        self.killed = True
+        self.finished.set()
+
+
+def patch_macos_sound(monkeypatch, return_code: int = 0) -> list[tuple[tuple, FakeSoundProcess]]:
+    calls: list[tuple[tuple, FakeSoundProcess]] = []
 
     async def create_subprocess_exec(*args, **kwargs):
-        calls.append((args, kwargs))
-        return Process()
+        process = FakeSoundProcess(return_code)
+        calls.append((args, process))
+        return process
 
     monkeypatch.setattr("price_alert.notifier.sys.platform", "darwin")
     monkeypatch.setattr("price_alert.notifier.asyncio.create_subprocess_exec", create_subprocess_exec)
+    return calls
 
-    asyncio.run(ConsoleNotifier(beep=True, colors=False).send(make_alert()))
+
+def test_console_notifier_uses_afplay_on_macos(monkeypatch, capsys):
+    calls = patch_macos_sound(monkeypatch)
+
+    async def scenario():
+        notifier = ConsoleNotifier(beep=True, colors=False)
+        await notifier.send(make_alert())
+        await asyncio.sleep(0)
+        calls[0][1].finished.set()
+        await notifier._sound_task
+
+    asyncio.run(scenario())
 
     assert calls[0][0] == (MACOS_SOUND_PLAYER, MACOS_ALERT_SOUND)
     assert "\a" not in capsys.readouterr().out
+
+
+def test_macos_sound_does_not_delay_burst_and_plays_once(monkeypatch, capsys):
+    calls = patch_macos_sound(monkeypatch)
+
+    async def scenario():
+        notifier = ConsoleNotifier(beep=True, colors=False)
+        # 声音未播完时连续提醒：文字必须立即输出，且不能叠加播放。
+        for symbol in ("BTC_USDT", "ETH_USDT", "SOL_USDT"):
+            await notifier.send(make_alert(symbol))
+            await asyncio.sleep(0)
+        output = capsys.readouterr().out
+        assert all(symbol in output for symbol in ("BTC_USDT", "ETH_USDT", "SOL_USDT"))
+        assert len(calls) == 1
+
+        calls[0][1].finished.set()
+        await notifier._sound_task
+        await notifier.send(make_alert("XRP_USDT"))
+        await asyncio.sleep(0)
+        assert len(calls) == 2
+        calls[1][1].finished.set()
+        await notifier._sound_task
+
+    asyncio.run(scenario())
+
+
+def test_macos_sound_nonzero_exit_is_logged(monkeypatch, caplog):
+    calls = patch_macos_sound(monkeypatch, return_code=1)
+
+    async def scenario():
+        notifier = ConsoleNotifier(beep=True, colors=False)
+        await notifier.send(make_alert())
+        await asyncio.sleep(0)
+        calls[0][1].finished.set()
+        await notifier._sound_task
+
+    asyncio.run(scenario())
+
+    assert "afplay 退出码：1" in caplog.text
+
+
+def test_cancelled_macos_sound_kills_player(monkeypatch):
+    calls = patch_macos_sound(monkeypatch)
+
+    async def scenario():
+        notifier = ConsoleNotifier(beep=True, colors=False)
+        await notifier.send(make_alert())
+        await asyncio.sleep(0)
+        notifier._sound_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await notifier._sound_task
+
+    asyncio.run(scenario())
+
+    assert calls[0][1].killed
 
 
 def test_console_notifier_keeps_terminal_bell_off_macos(monkeypatch, capsys):
@@ -120,7 +202,12 @@ def test_macos_sound_failure_does_not_hide_alert(monkeypatch, capsys, caplog):
     monkeypatch.setattr("price_alert.notifier.sys.platform", "darwin")
     monkeypatch.setattr("price_alert.notifier.asyncio.create_subprocess_exec", create_subprocess_exec)
 
-    asyncio.run(ConsoleNotifier(beep=True, colors=False).send(make_alert()))
+    async def scenario():
+        notifier = ConsoleNotifier(beep=True, colors=False)
+        await notifier.send(make_alert())
+        await notifier._sound_task
+
+    asyncio.run(scenario())
 
     assert "[暴涨提醒]" in capsys.readouterr().out
     assert "macOS 提示音播放失败" in caplog.text
