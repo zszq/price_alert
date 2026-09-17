@@ -5,7 +5,7 @@ from datetime import UTC, datetime
 from colorama import Fore, Style
 
 from price_alert.models import PriceAlert
-from price_alert.notifier import JsonlNotifier, colorize_alert, format_alert
+from price_alert.notifier import AlertDispatcher, JsonlNotifier, colorize_alert, format_alert
 
 
 def test_jsonl_notifier_writes_atr_alert(tmp_path):
@@ -58,3 +58,108 @@ def test_drop_alert_is_red():
     assert alert.to_dict()["color"] == "red"
     assert "价格下跌 1.00%" in format_alert(alert)
     assert colorize_alert(alert, "drop") == f"{Fore.RED}drop{Style.RESET_ALL}"
+
+
+def make_alert(symbol: str = "BTC_USDT") -> PriceAlert:
+    return PriceAlert(
+        symbol=symbol,
+        direction="surge",
+        price=101.0,
+        reference_price=100.0,
+        change_percent=1.0,
+        move_atr=1.25,
+        atr=0.8,
+        atr_period=14,
+        lookback_seconds=30,
+        trade_count=10,
+        volume_24h_quote=1_000_000_000,
+        timestamp=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
+class RecordingNotifier:
+    def __init__(self) -> None:
+        self.symbols: list[str] = []
+
+    async def send(self, alert: PriceAlert) -> None:
+        self.symbols.append(alert.symbol)
+
+
+class BlockingNotifier:
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.symbols: list[str] = []
+
+    async def send(self, alert: PriceAlert) -> None:
+        await self.release.wait()
+        self.symbols.append(alert.symbol)
+
+
+class FailingNotifier:
+    async def send(self, alert: PriceAlert) -> None:
+        raise RuntimeError("webhook down")
+
+
+def test_slow_channel_does_not_block_publish_or_other_channels():
+    async def scenario():
+        fast, slow = RecordingNotifier(), BlockingNotifier()
+        async with AlertDispatcher([slow, fast]) as dispatcher:
+            dispatcher.publish(make_alert("A_USDT"))
+            dispatcher.publish(make_alert("B_USDT"))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            fast_before_release = list(fast.symbols)
+            slow_before_release = list(slow.symbols)
+            slow.release.set()
+        return fast_before_release, slow_before_release, slow.symbols
+
+    fast_before, slow_before, slow_after = asyncio.run(scenario())
+
+    assert fast_before == ["A_USDT", "B_USDT"]
+    assert slow_before == []
+    # 退出时会把已排队的提醒发完。
+    assert slow_after == ["A_USDT", "B_USDT"]
+
+
+def test_failed_channel_is_logged_and_keeps_processing(caplog):
+    async def scenario():
+        recorder = RecordingNotifier()
+        async with AlertDispatcher([FailingNotifier(), recorder]) as dispatcher:
+            dispatcher.publish(make_alert("A_USDT"))
+            dispatcher.publish(make_alert("B_USDT"))
+        return recorder.symbols
+
+    assert asyncio.run(scenario()) == ["A_USDT", "B_USDT"]
+    assert "FailingNotifier 发送失败" in caplog.text
+
+
+def test_full_queue_drops_alert_instead_of_blocking(caplog):
+    async def scenario():
+        slow = BlockingNotifier()
+        dispatcher = AlertDispatcher([slow], queue_size=1, drain_timeout=0.01)
+        async with dispatcher:
+            dispatcher.publish(make_alert("A_USDT"))
+            # 让后台任务取走第一条并卡在发送中，队列才会只剩一个空位。
+            await asyncio.sleep(0)
+            dispatcher.publish(make_alert("B_USDT"))
+            dispatcher.publish(make_alert("C_USDT"))
+
+    asyncio.run(scenario())
+
+    assert "积压已满，丢弃 C_USDT" in caplog.text
+
+
+def test_jsonl_notifier_rotates_whole_files(tmp_path):
+    target = tmp_path / "alerts.jsonl"
+    notifier = JsonlNotifier(target, max_bytes=1, backup_count=2)
+
+    for symbol in ("A_USDT", "B_USDT", "C_USDT", "D_USDT"):
+        asyncio.run(notifier.send(make_alert(symbol)))
+
+    def symbols(path):
+        return [json.loads(line)["symbol"] for line in path.read_text(encoding="utf-8").splitlines()]
+
+    assert symbols(target) == ["D_USDT"]
+    assert symbols(tmp_path / "alerts.jsonl.1") == ["C_USDT"]
+    assert symbols(tmp_path / "alerts.jsonl.2") == ["B_USDT"]
+    assert not (tmp_path / "alerts.jsonl.3").exists()

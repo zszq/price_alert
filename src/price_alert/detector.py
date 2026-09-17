@@ -18,10 +18,20 @@ class _SecondBucket:
     total_size: float = 0.0
     price_sum: float = 0.0
     trade_count: int = 0
+    last_price: float | None = None
+
+    @classmethod
+    def carried(cls, timestamp: datetime, price: float) -> _SecondBucket:
+        return cls(timestamp, last_price=price)
+
+    @property
+    def has_trades(self) -> bool:
+        return self.trade_count > 0
 
     def add(self, price: float, size: float) -> None:
         self.price_sum += price
         self.trade_count += 1
+        self.last_price = price
         if size > 0:
             self.weighted_price_sum += price * size
             self.total_size += size
@@ -31,7 +41,11 @@ class _SecondBucket:
         # 成交量加权能降低小额离群成交的影响；零成交量数据退化为普通均价。
         if self.total_size > 0:
             return self.weighted_price_sum / self.total_size
-        return self.price_sum / self.trade_count
+        if self.trade_count > 0:
+            return self.price_sum / self.trade_count
+        # 无成交的秒没有新的价格发现，市场价格仍停留在最后一笔成交。
+        assert self.last_price is not None
+        return self.last_price
 
 
 @dataclass(slots=True)
@@ -41,6 +55,10 @@ class _LiveBar:
     high: float
     low: float
     close: float
+
+    @classmethod
+    def from_candle(cls, candle: Candle) -> _LiveBar:
+        return cls(candle.timestamp, candle.open, candle.high, candle.low, candle.close)
 
     def update(self, price: float) -> None:
         self.high = max(self.high, price)
@@ -86,6 +104,7 @@ class AtrMoveDetector:
         self.min_window_trades = min_window_trades
         self.max_atr_age = timedelta(seconds=max_atr_age_seconds)
         self.cooldown = timedelta(seconds=cooldown_seconds)
+        self._candle_interval = timedelta(seconds=candle_interval_seconds)
         self._states: dict[str, _SymbolState] = {}
         self._last_alert: dict[str, datetime] = {}
 
@@ -93,7 +112,13 @@ class AtrMoveDetector:
     def symbols(self) -> list[str]:
         return sorted(self._states)
 
-    def add_symbol(self, symbol: str, candles: list[Candle], volume_24h_quote: float) -> None:
+    def add_symbol(
+        self,
+        symbol: str,
+        candles: list[Candle],
+        volume_24h_quote: float,
+        live_candle: Candle | None = None,
+    ) -> None:
         normalized = symbol.upper()
         existing = self._states.get(normalized)
         if existing is not None:
@@ -101,17 +126,26 @@ class AtrMoveDetector:
             return
         atr = WilderAtr(self.atr_period)
         atr.seed(candles)
-        self._states[normalized] = _SymbolState(atr=atr, volume_24h_quote=volume_24h_quote)
+        state = _SymbolState(atr=atr, volume_24h_quote=volume_24h_quote)
+        if live_candle is not None and (atr.last_timestamp is None or live_candle.timestamp > atr.last_timestamp):
+            # 订阅前当前 K 线已走完一段，用 REST 的未收盘 K 线起步，避免只含订阅后成交的残缺 K 线低估 ATR。
+            state.live_bar = _LiveBar.from_candle(live_candle)
+        self._states[normalized] = state
 
     def remove_symbols(self, symbols: set[str]) -> None:
+        # 冷却记录刻意保留：合约被移出后很快重新入池时，不应绕过冷却再次提醒同一段行情。
         for symbol in symbols:
             self._states.pop(symbol, None)
-        self._last_alert = {
-            symbol: timestamp for symbol, timestamp in self._last_alert.items() if symbol not in symbols
-        }
+
+    def reset_realtime(self) -> None:
+        """行情中断后调用：丢弃秒级窗口与确认进度，避免把断线前后的价格当作连续行情比较。"""
+        for state in self._states.values():
+            state.buckets.clear()
+            self._reset_candidate(state)
 
     def add_tick(self, tick: PriceTick) -> list[PriceAlert]:
-        state = self._states.get(tick.symbol.upper())
+        symbol = tick.symbol.upper()
+        state = self._states.get(symbol)
         if state is None:
             return []
 
@@ -123,25 +157,45 @@ class AtrMoveDetector:
         self._update_bar(state, tick.price, timestamp)
 
         second = timestamp.replace(microsecond=0)
-        is_new_second = not state.buckets or state.buckets[-1].timestamp != second
-        if not is_new_second:
+        if state.buckets and state.buckets[-1].timestamp == second:
             state.buckets[-1].add(tick.price, tick.size)
             return []
 
-        completed = state.buckets[-1] if state.buckets else None
+        alerts: list[PriceAlert] = []
+        if state.buckets:
+            completed = state.buckets[-1]
+            # 等一秒结束后再使用整秒 VWAP，避免把新一秒的第一笔成交误当成稳定价格。
+            self._settle(symbol, state, completed, timestamp, alerts)
+            missing_seconds = int((second - completed.timestamp).total_seconds()) - 1
+            # 稀疏合约在快速行情中常有空秒，沿用最后成交价补齐才能完成连续确认；
+            # 空档超过观察窗口说明行情停滞，补齐已无比较意义。
+            if 0 < missing_seconds <= self.lookback_seconds:
+                last_price = completed.last_price
+                assert last_price is not None
+                for offset in range(1, missing_seconds + 1):
+                    filler = _SecondBucket.carried(completed.timestamp + timedelta(seconds=offset), last_price)
+                    state.buckets.append(filler)
+                    self._settle(symbol, state, filler, timestamp, alerts)
+
         current = _SecondBucket(second)
         current.add(tick.price, tick.size)
         state.buckets.append(current)
-        if completed is None:
-            return []
+        return alerts
 
-        oldest_required = completed.timestamp - timedelta(seconds=self.lookback_seconds)
+    def _settle(
+        self,
+        symbol: str,
+        state: _SymbolState,
+        bucket: _SecondBucket,
+        timestamp: datetime,
+        alerts: list[PriceAlert],
+    ) -> None:
+        oldest_required = bucket.timestamp - timedelta(seconds=self.lookback_seconds)
         while len(state.buckets) > 2 and state.buckets[1].timestamp <= oldest_required:
             state.buckets.popleft()
-
-        # 等一秒结束后再使用整秒 VWAP，避免把新一秒的第一笔成交误当成稳定价格。
-        alert = self._evaluate(tick.symbol.upper(), state, completed, timestamp)
-        return [alert] if alert is not None else []
+        alert = self._evaluate(symbol, state, bucket, timestamp)
+        if alert is not None:
+            alerts.append(alert)
 
     def _update_bar(self, state: _SymbolState, price: float, timestamp: datetime) -> None:
         bar_timestamp = self._floor_time(timestamp)
@@ -172,7 +226,8 @@ class AtrMoveDetector:
         if atr is None or atr <= 0 or atr_timestamp is None:
             self._reset_candidate(state)
             return None
-        if timestamp - atr_timestamp > self.max_atr_age:
+        # K 线时间戳是开盘时间，按收盘时间计算年龄，配置值才等于“ATR 最近一次更新距今多久”。
+        if timestamp - (atr_timestamp + self._candle_interval) > self.max_atr_age:
             self._reset_candidate(state)
             return None
 
@@ -205,6 +260,9 @@ class AtrMoveDetector:
 
         direction = "surge" if price_move > 0 else "drop"
         if not self._confirm_candidate(state, direction, current.timestamp):
+            return None
+        if not current.has_trades:
+            # 补齐的空秒只延续确认进度，不能单独触发：否则一笔离群成交后恰好无人成交也会被当成持续异动。
             return None
 
         previous_alert = self._last_alert.get(symbol)

@@ -9,6 +9,9 @@ from typing import Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+# K 线周期映射只保留这一份，避免服务编排与配置校验各自维护而出现分歧。
+INTERVAL_SECONDS: dict[str, int] = {"1m": 60, "5m": 300, "15m": 900}
+
 
 class GateConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -17,6 +20,7 @@ class GateConfig(BaseModel):
     websocket_url: str = "wss://fx-ws.gateio.ws/v4/ws/usdt"
     settle: Literal["usdt"] = "usdt"
     min_volume_24h_quote: float = Field(default=10_000_000, gt=0)
+    universe_exit_volume_ratio: float = Field(default=0.8, gt=0, le=1)
     universe_refresh_seconds: int = Field(default=600, ge=60, le=86400)
     rest_timeout_seconds: float = Field(default=15.0, gt=0, le=60)
     rest_retries: int = Field(default=3, ge=1, le=10)
@@ -26,6 +30,12 @@ class GateConfig(BaseModel):
     reconnect_initial_seconds: float = Field(default=1.0, gt=0, le=60)
     reconnect_max_seconds: float = Field(default=30.0, gt=0, le=300)
     status_interval_seconds: int = Field(default=60, gt=0, le=3600)
+
+    @model_validator(mode="after")
+    def validate_reconnect_backoff(self) -> GateConfig:
+        if self.reconnect_max_seconds < self.reconnect_initial_seconds:
+            raise ValueError("reconnect_max_seconds 不能小于 reconnect_initial_seconds")
+        return self
 
 
 class IndicatorConfig(BaseModel):
@@ -45,7 +55,13 @@ class IndicatorConfig(BaseModel):
     def validate_warmup_and_freshness(self) -> IndicatorConfig:
         if self.warmup_candles <= self.atr_period:
             raise ValueError("warmup_candles 必须大于 atr_period，以便排除尚未收盘的 K 线")
-        interval_seconds = {"1m": 60, "5m": 300, "15m": 900}[self.candle_interval]
+        if self.confirmation_seconds > self.lookback_seconds:
+            # 确认期长于观察窗口时，基准价会追上已经完成的跳变，持续性的异动反而永远无法确认。
+            raise ValueError("confirmation_seconds 不能大于 lookback_seconds")
+        interval_seconds = INTERVAL_SECONDS[self.candle_interval]
+        if "max_atr_age_seconds" not in self.model_fields_set:
+            # 未显式配置时跟随 K 线周期，只改 candle_interval 就不会因固定默认值过小而校验失败。
+            self.max_atr_age_seconds = interval_seconds * 3
         if self.max_atr_age_seconds < interval_seconds * 2:
             raise ValueError("max_atr_age_seconds 不能小于两个 K 线周期")
         return self
@@ -55,10 +71,13 @@ class AlertConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     cooldown_seconds: int = Field(default=30, ge=0, le=86400)
+    queue_size: int = Field(default=1000, ge=1, le=100_000)
     console: bool = True
     console_colors: bool = True
     beep: bool = True
     jsonl_path: Path | None = Path("data/alerts/alerts.jsonl")
+    jsonl_max_bytes: int = Field(default=10_000_000, ge=0)
+    jsonl_backup_count: int = Field(default=5, ge=1, le=100)
     webhook_url: str | None = None
     webhook_timeout_seconds: float = Field(default=5.0, gt=0, le=30)
 

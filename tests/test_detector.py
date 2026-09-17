@@ -116,3 +116,108 @@ def test_ignores_unknown_and_out_of_order_ticks():
     assert instance.add_tick(PriceTick("OTHER_USDT", 100, 1, current)) == []
     instance.add_tick(PriceTick("BTC_USDT", 100, 1, current))
     assert instance.add_tick(PriceTick("BTC_USDT", 80, 1, current - timedelta(seconds=1))) == []
+
+
+def feed_window_at(instance: AtrMoveDetector, symbol: str, final_price: float, start):
+    alerts = []
+    for second in range(11):
+        instance.add_tick(PriceTick(symbol, 100.0, 1.0, start + timedelta(seconds=second)))
+    for second in range(11, 14):
+        alerts.extend(instance.add_tick(PriceTick(symbol, final_price, 1.0, start + timedelta(seconds=second))))
+    return alerts
+
+
+def test_sparse_trades_are_confirmed_by_carrying_last_price_through_empty_seconds():
+    instance = detector()
+    instance.add_symbol("THIN_USDT", history(1.0), 20_000_000)
+    start = BASE + timedelta(minutes=3)
+    for second in range(11):
+        instance.add_tick(PriceTick("THIN_USDT", 100.0, 1.0, start + timedelta(seconds=second)))
+
+    # 每隔一秒才有一笔成交：旧逻辑因“相邻秒”被打断而永远无法确认。
+    assert instance.add_tick(PriceTick("THIN_USDT", 101.0, 1.0, start + timedelta(seconds=11))) == []
+    assert instance.add_tick(PriceTick("THIN_USDT", 101.0, 1.0, start + timedelta(seconds=13))) == []
+    alerts = instance.add_tick(PriceTick("THIN_USDT", 101.0, 1.0, start + timedelta(seconds=15)))
+
+    assert len(alerts) == 1
+    assert alerts[0].direction == "surge"
+
+
+def test_single_wick_followed_by_silence_does_not_alert_from_carried_seconds():
+    instance = detector()
+    instance.add_symbol("THIN_USDT", history(1.0), 20_000_000)
+    start = BASE + timedelta(minutes=3)
+    for second in range(11):
+        instance.add_tick(PriceTick("THIN_USDT", 100.0, 1.0, start + timedelta(seconds=second)))
+
+    alerts = []
+    alerts.extend(instance.add_tick(PriceTick("THIN_USDT", 101.0, 1.0, start + timedelta(seconds=11))))
+    # 空秒 12、13 延续了确认进度，但价格在下一笔真实成交时已经回落，不能提醒。
+    alerts.extend(instance.add_tick(PriceTick("THIN_USDT", 100.0, 1.0, start + timedelta(seconds=14))))
+    alerts.extend(instance.add_tick(PriceTick("THIN_USDT", 100.0, 1.0, start + timedelta(seconds=15))))
+
+    assert alerts == []
+
+
+def test_gap_longer_than_lookback_is_not_filled():
+    instance = detector()
+    instance.add_symbol("THIN_USDT", history(1.0), 20_000_000)
+    start = BASE + timedelta(minutes=3)
+    for second in range(11):
+        instance.add_tick(PriceTick("THIN_USDT", 100.0, 1.0, start + timedelta(seconds=second)))
+
+    alerts = []
+    for second in (40, 41, 42):
+        alerts.extend(instance.add_tick(PriceTick("THIN_USDT", 101.0, 1.0, start + timedelta(seconds=second))))
+
+    assert alerts == []
+
+
+def test_reset_realtime_prevents_comparing_prices_across_disconnect():
+    instance = detector()
+    instance.add_symbol("BTC_USDT", history(1.0), 1_000_000_000)
+    start = BASE + timedelta(minutes=3)
+    for second in range(11):
+        instance.add_tick(PriceTick("BTC_USDT", 100.0, 1.0, start + timedelta(seconds=second)))
+
+    instance.reset_realtime()
+    alerts = []
+    for second in range(11, 15):
+        alerts.extend(instance.add_tick(PriceTick("BTC_USDT", 101.0, 1.0, start + timedelta(seconds=second))))
+
+    assert alerts == []
+
+
+def test_atr_age_is_measured_from_candle_close():
+    fresh = detector()
+    fresh.add_symbol("BTC_USDT", history(1.0), 1_000_000_000)
+    # 最后一根种子 K 线 02:00 开盘、03:00 收盘；05:10 起的窗口距收盘不到 180 秒，仍应判定。
+    assert len(feed_window_at(fresh, "BTC_USDT", 101.0, BASE + timedelta(minutes=5, seconds=10))) == 1
+
+    stale = detector()
+    stale.add_symbol("BTC_USDT", history(1.0), 1_000_000_000)
+    assert feed_window_at(stale, "BTC_USDT", 101.0, BASE + timedelta(minutes=6, seconds=10)) == []
+
+
+def test_live_candle_from_warmup_is_included_in_next_atr_update():
+    with_live = detector()
+    live_candle = Candle(BASE + timedelta(minutes=3), 100.0, 106.0, 100.0, 100.0)
+    with_live.add_symbol("BTC_USDT", history(1.0), 1_000_000_000, live_candle)
+    without_live = detector()
+    without_live.add_symbol("BTC_USDT", history(1.0), 1_000_000_000)
+
+    start = BASE + timedelta(minutes=4)
+    # 订阅前的 6 点振幅计入 ATR 后，1% 位移不再足够异常。
+    assert feed_window_at(with_live, "BTC_USDT", 101.0, start) == []
+    assert len(feed_window_at(without_live, "BTC_USDT", 101.0, start)) == 1
+
+
+def test_cooldown_survives_symbol_leaving_and_rejoining_universe():
+    instance = detector()
+    instance.add_symbol("BTC_USDT", history(1.0), 1_000_000_000)
+    assert len(feed_window(instance, "BTC_USDT", 101.0)) == 1
+
+    instance.remove_symbols({"BTC_USDT"})
+    instance.add_symbol("BTC_USDT", history(1.0), 1_000_000_000)
+
+    assert feed_window_at(instance, "BTC_USDT", 99.0, BASE + timedelta(minutes=3, seconds=20)) == []

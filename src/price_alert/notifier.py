@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import urllib.request
 from collections.abc import Iterable
 from datetime import timedelta, timezone
 from pathlib import Path
+from types import TracebackType
 from typing import Protocol
 
 from colorama import Fore, Style, just_fix_windows_console
@@ -56,16 +58,29 @@ class ConsoleNotifier:
 
 
 class JsonlNotifier:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, max_bytes: int = 0, backup_count: int = 5) -> None:
         self.path = path
+        self.max_bytes = max_bytes
+        self.backup_count = backup_count
 
     async def send(self, alert: PriceAlert) -> None:
         await asyncio.to_thread(self._append, alert)
 
     def _append(self, alert: PriceAlert) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._rotate_if_needed()
         with self.path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(alert.to_dict(), ensure_ascii=False) + "\n")
+
+    def _rotate_if_needed(self) -> None:
+        # 按整文件轮转而不是截断，保证每个文件里的每一行仍是完整 JSON。
+        if self.max_bytes <= 0 or not self.path.exists() or self.path.stat().st_size < self.max_bytes:
+            return
+        for index in range(self.backup_count - 1, 0, -1):
+            source = self.path.with_name(f"{self.path.name}.{index}")
+            if source.exists():
+                source.replace(self.path.with_name(f"{self.path.name}.{index + 1}"))
+        self.path.replace(self.path.with_name(f"{self.path.name}.1"))
 
 
 class WebhookNotifier:
@@ -84,29 +99,74 @@ class WebhookNotifier:
             headers={"Content-Type": "application/json; charset=utf-8"},
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:  # noqa: S310
-            if response.status >= 400:
-                raise RuntimeError(f"Webhook 返回 HTTP {response.status}")
+        # urlopen 遇到 4xx/5xx 会直接抛出 HTTPError，由分发器统一记录。
+        with urllib.request.urlopen(request, timeout=self.timeout_seconds):  # noqa: S310
+            pass
 
 
-class NotifierHub:
-    def __init__(self, notifiers: Iterable[Notifier]) -> None:
+class AlertDispatcher:
+    """每个通道独立的队列与后台任务：慢 Webhook 既不阻塞行情处理，也不拖慢控制台提醒。"""
+
+    def __init__(self, notifiers: Iterable[Notifier], queue_size: int = 1000, drain_timeout: float = 5.0) -> None:
         self.notifiers = list(notifiers)
+        self.drain_timeout = drain_timeout
+        self._queues: list[asyncio.Queue[PriceAlert]] = [asyncio.Queue(queue_size) for _ in self.notifiers]
+        self._workers: list[asyncio.Task[None]] = []
 
-    async def send(self, alert: PriceAlert) -> None:
-        results = await asyncio.gather(*(notifier.send(alert) for notifier in self.notifiers), return_exceptions=True)
-        for notifier, result in zip(self.notifiers, results, strict=True):
-            if isinstance(result, Exception):
+    async def __aenter__(self) -> AlertDispatcher:
+        self._workers = [
+            asyncio.create_task(self._run(notifier, queue), name=f"notifier-{type(notifier).__name__}")
+            for notifier, queue in zip(self.notifiers, self._queues, strict=True)
+        ]
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> None:
+        await self.aclose()
+
+    def publish(self, alert: PriceAlert) -> None:
+        for notifier, queue in zip(self.notifiers, self._queues, strict=True):
+            try:
+                queue.put_nowait(alert)
+            except asyncio.QueueFull:
+                # 宁可丢弃单个通道的提醒，也不能让积压反压到行情接收导致全市场断线。
+                LOGGER.error("提醒通道 %s 积压已满，丢弃 %s 提醒", type(notifier).__name__, alert.symbol)
+
+    async def aclose(self) -> None:
+        if not self._workers:
+            return
+        # 停止前尽量把已触发的提醒发完；超时说明通道卡死，不能无限期阻塞退出。
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(self.drain_timeout):
+                await asyncio.gather(*(queue.join() for queue in self._queues))
+        for worker in self._workers:
+            worker.cancel()
+        await asyncio.gather(*self._workers, return_exceptions=True)
+        self._workers = []
+
+    @staticmethod
+    async def _run(notifier: Notifier, queue: asyncio.Queue[PriceAlert]) -> None:
+        while True:
+            alert = await queue.get()
+            try:
+                await notifier.send(alert)
+            except Exception as exc:
                 # 单个提醒出口失败不应中断全市场行情监控。
-                LOGGER.error("提醒通道 %s 发送失败：%s", type(notifier).__name__, result)
+                LOGGER.error("提醒通道 %s 发送失败：%s", type(notifier).__name__, exc)
+            finally:
+                queue.task_done()
 
 
-def build_notifier(config: AlertConfig) -> NotifierHub:
+def build_notifiers(config: AlertConfig) -> list[Notifier]:
     notifiers: list[Notifier] = []
     if config.console:
         notifiers.append(ConsoleNotifier(config.beep, config.console_colors))
     if config.jsonl_path is not None:
-        notifiers.append(JsonlNotifier(config.jsonl_path))
+        notifiers.append(JsonlNotifier(config.jsonl_path, config.jsonl_max_bytes, config.jsonl_backup_count))
     if config.webhook_url:
         notifiers.append(WebhookNotifier(config.webhook_url, config.webhook_timeout_seconds))
-    return NotifierHub(notifiers)
+    return notifiers

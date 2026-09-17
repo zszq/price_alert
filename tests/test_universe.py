@@ -55,3 +55,32 @@ def test_excludes_contract_when_classification_is_missing():
     )
 
     assert selected == []
+
+
+def test_excludes_contracts_in_delisting():
+    selected = select_liquid_contracts(
+        [{"contract": "OLD_USDT", "last": "1", "volume_24h_quote": "20000000"}],
+        [{"name": "OLD_USDT", "contract_type": "", "status": "trading", "in_delisting": True}],
+        10_000_000,
+    )
+
+    assert selected == []
+
+
+def test_retained_contracts_use_lower_exit_threshold():
+    tickers = [
+        {"contract": "KEEP_USDT", "last": "1", "volume_24h_quote": "9000000"},
+        {"contract": "NEW_USDT", "last": "1", "volume_24h_quote": "9000000"},
+        {"contract": "DROP_USDT", "last": "1", "volume_24h_quote": "7000000"},
+    ]
+    contracts = [{"name": item["contract"], "contract_type": "", "status": "trading"} for item in tickers]
+
+    selected = select_liquid_contracts(
+        tickers,
+        contracts,
+        10_000_000,
+        retained_symbols=["keep_usdt", "DROP_USDT"],
+        exit_volume_ratio=0.8,
+    )
+
+    assert [item.symbol for item in selected] == ["KEEP_USDT"]

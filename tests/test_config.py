@@ -47,3 +47,20 @@ def test_code_defaults_match_default_yaml(monkeypatch):
     default_yaml = Path(__file__).resolve().parents[1] / "config" / "default.yaml"
 
     assert AppConfig() == load_config(default_yaml)
+
+
+def test_rejects_reconnect_max_below_initial_delay():
+    with pytest.raises(ValidationError, match="reconnect_max_seconds"):
+        AppConfig.model_validate({"gate": {"reconnect_initial_seconds": 10, "reconnect_max_seconds": 5}})
+
+
+def test_rejects_confirmation_longer_than_lookback():
+    with pytest.raises(ValidationError, match="confirmation_seconds"):
+        AppConfig.model_validate({"indicator": {"lookback_seconds": 5, "confirmation_seconds": 6}})
+
+
+def test_atr_age_default_follows_candle_interval_but_explicit_value_is_validated():
+    assert AppConfig.model_validate({"indicator": {"candle_interval": "5m"}}).indicator.max_atr_age_seconds == 900
+
+    with pytest.raises(ValidationError, match="max_atr_age_seconds"):
+        AppConfig.model_validate({"indicator": {"candle_interval": "5m", "max_atr_age_seconds": 180}})

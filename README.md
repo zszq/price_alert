@@ -18,10 +18,14 @@ ATR 异动强度 = |当前完整秒 VWAP - N 秒前完整秒 VWAP| / Wilder ATR
 - 比较当前完整秒的成交量加权均价与 30 秒前的完整秒均价；
 - 实际涨跌幅至少达到 1%，同时位移至少达到 1.5 ATR；
 - 两道门槛连续满足 3 秒，且窗口内至少有 5 笔成交时提醒；
-- 同一合约无论涨跌方向，在 30 秒内只提醒一次；
-- 每 10 分钟刷新交易对池，新增和移除合约自动生效。
+- 同一合约无论涨跌方向，在 30 秒内只提醒一次；合约移出合约池后重新入池，冷却记录仍然有效；
+- 每 10 分钟刷新交易对池，通过增量订阅/退订生效，不会断开实时连接；已在监控中的合约成交额跌破门槛的 80% 才会被移除，避免在门槛附近反复进出。
 
 触发距离等于 `max(基准价格 × 1%, ATR × 1.5)`。最低 1% 保证提醒具有足够的实际价格幅度，ATR 门槛则随着近期波动率动态变化。完整秒 VWAP 和连续确认用于过滤单笔离群成交与瞬时价格尖刺。
+
+成交稀疏的合约在快速行情中常出现没有成交的空秒。空秒（不超过观察窗口长度）会沿用最后成交价参与连续确认，但提醒只会在有真实成交的秒触发，所以一笔离群成交后恰好无人成交，不会被误判为持续异动。实时连接断开重连后，秒级窗口和确认进度会清空，不会把断线前后的价格当作连续行情比较。
+
+ATR 预热时，REST 返回的当前未收盘 K 线会作为实时 K 线的起点，避免第一根实时 K 线只包含订阅之后的成交而低估 ATR。
 
 ## 数据流程
 
@@ -41,7 +45,9 @@ Gate WebSocket futures.trades 实时成交
 控制台声音 + JSONL + 可选 Webhook
 ```
 
-项目通过 Gate 合约元数据的 `contract_type` 排除股票、指数、外汇、贵金属和商品等非币类合约，并且只监控 `status=trading` 的品种。Gate 官方将 `volume_24h_usd` 标记为弃用，因此项目使用 `volume_24h_quote`。`is_internal=true` 的内部成交可能偏离正常盘口且不会进入 K 线，检测时会主动忽略。
+项目通过 Gate 合约元数据的 `contract_type` 排除股票、指数、外汇、贵金属和商品等非币类合约，并且只监控 `status=trading` 且不在下架流程（`in_delisting`）中的品种。Gate 官方将 `volume_24h_usd` 标记为弃用，因此项目使用 `volume_24h_quote`。`is_internal=true` 的内部成交可能偏离正常盘口且不会进入 K 线，检测时会主动忽略。
+
+Gate 在一批订阅中只要有一个无效合约，整批都会失败。程序会识别订阅失败的响应，把该批合约改为逐个订阅，只放弃真正被拒绝的合约并记录错误日志。单笔无法解析的成交数据只会被跳过（同类日志每分钟最多输出一次），不会断开整个连接。
 
 ## 安装
 
@@ -82,6 +88,8 @@ Windows 可以双击 `start-monitor.bat`，或者运行：
 .\.venv\Scripts\python.exe -m price_alert.cli simulate
 ```
 
+如果当前配置下模拟行情没有产生提醒，命令会以非零退出码结束并给出提示。配置文件缺失或校验失败时，会列出出错的配置键路径。
+
 ## 提醒示例
 
 ```text
@@ -90,7 +98,7 @@ Windows 可以双击 `start-monitor.bat`，或者运行：
 
 提醒时间使用北京时间，格式为 `YYYY-MM-DD HH:MM:SS`。控制台中暴涨提醒显示为绿色，暴跌提醒显示为红色；文本明确显示价格涨跌百分比，不显示原始 ATR 数值和 24 小时成交额。JSONL 和 Webhook 记录仍保留完整结构化字段，并包含值为 `green` 或 `red` 的 `color` 字段。
 
-实时提醒默认追加到 `data/alerts/alerts.jsonl`。每行是一条完整 JSON，即使程序异常退出，也不会破坏之前的记录。
+实时提醒默认追加到 `data/alerts/alerts.jsonl`。每行是一条完整 JSON，即使程序异常退出，也不会破坏之前的记录。文件超过 `alerts.jsonl_max_bytes` 后整体轮转为 `alerts.jsonl.1`、`alerts.jsonl.2` 等，最多保留 `alerts.jsonl_backup_count` 个历史文件。
 
 ## Webhook
 
@@ -101,24 +109,28 @@ $env:PRICE_ALERT_WEBHOOK_URL = "https://example.com/your-webhook"
 .\.venv\Scripts\python.exe -m price_alert.cli run
 ```
 
-环境变量优先，适合包含密钥的地址。Webhook 会收到可直接展示的 `text`，以及 ATR、ATR 倍数、起止价格、成交额和时间等结构化字段。单个通知通道失败不会中断行情监控。
+环境变量优先，适合包含密钥的地址。Webhook 会收到可直接展示的 `text`，以及 ATR、ATR 倍数、起止价格、成交额和时间等结构化字段。每个通知通道都有独立的队列和后台任务，Webhook 响应慢既不会阻塞行情处理，也不会拖慢控制台提醒；单个通道失败只记录日志，不会中断行情监控。某个通道积压超过 `alerts.queue_size` 时，会丢弃该通道的新提醒并记录错误。
 
 ## 配置说明
 
 `config/default.yaml` 的主要参数：
 
 - `gate.min_volume_24h_quote`：24 小时 USDT 计价成交额门槛；
+- `gate.universe_exit_volume_ratio`：已在监控中的合约的退出门槛比例，成交额低于 `min_volume_24h_quote × 该比例` 才移除，默认 0.8；
 - `gate.universe_refresh_seconds`：交易对池刷新周期；
+- `gate.reconnect_initial_seconds` / `gate.reconnect_max_seconds`：断线重连的指数退避初始值与上限，上限不能小于初始值；
 - `indicator.candle_interval`：ATR K 线周期；
 - `indicator.atr_period`：Wilder ATR 周期；
 - `indicator.lookback_seconds`：短时位移观察窗口；
 - `indicator.trigger_atr_multiple`：触发所需 ATR 倍数；
 - `indicator.min_change_percent`：触发所需的最低实际涨跌幅；
-- `indicator.confirmation_seconds`：超过动态门槛后需要连续确认的秒数；
+- `indicator.confirmation_seconds`：超过动态门槛后需要连续确认的秒数，不能大于 `lookback_seconds`；
 - `indicator.min_window_trades`：窗口内最低成交笔数；
-- `indicator.max_atr_age_seconds`：ATR 过期保护；
+- `indicator.max_atr_age_seconds`：ATR 过期保护，按最近一根计入 ATR 的 K 线的收盘时间计算，不能小于两个 K 线周期；不填写时默认为三个 K 线周期；
 - `alerts.cooldown_seconds`：同一合约的统一提醒冷却时间；
+- `alerts.queue_size`：每个通知通道允许积压的提醒数量；
 - `alerts.console_colors`：是否启用控制台颜色，默认开启；
+- `alerts.jsonl_max_bytes` / `alerts.jsonl_backup_count`：JSONL 轮转大小（0 表示不轮转）与保留的历史文件数；
 
 ## 工程结构
 
@@ -132,10 +144,10 @@ src/price_alert/
 ├── indicators.py            Wilder ATR
 ├── detector.py              ATR 标准化异动检测
 ├── instance.py              防止重复提醒的跨平台进程锁
-├── notifier.py              控制台、JSONL、Webhook
-├── service.py               预热、刷新、重连和服务编排
+├── notifier.py              控制台、JSONL、Webhook 与独立队列分发
+├── service.py               预热、增量刷新、重连和服务编排
 └── cli.py                   run/universe/check-config/simulate
-tests/                       指标、筛选、解析、检测和通知测试
+tests/                       指标、筛选、解析、检测、通知、服务编排和命令行测试
 data/alerts/                 本地告警记录
 ```
 
