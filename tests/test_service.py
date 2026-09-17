@@ -168,7 +168,8 @@ def test_refresh_warms_new_symbols_keeps_hysteresis_and_updates_feed_without_rec
 
     detector, feed, first, second = asyncio.run(scenario())
 
-    assert first.candle_requests == ["BTC_USDT", "ETH_USDT"]
+    # 新合约经 to_thread 并发预热，请求先后取决于线程调度，只校验请求集合。
+    assert sorted(first.candle_requests) == ["BTC_USDT", "ETH_USDT"]
     assert second.candle_requests == ["SOL_USDT"]
     assert detector.symbols == ["ETH_USDT", "SOL_USDT"]
     assert feed.symbols == ["ETH_USDT", "SOL_USDT"]
