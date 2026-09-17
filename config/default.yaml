@@ -25,7 +25,7 @@ indicator:
   max_atr_age_seconds: 180
 
 alerts:
-  cooldown_seconds: 120
+  cooldown_seconds: 60
   console: true
   console_colors: true
   beep: true
