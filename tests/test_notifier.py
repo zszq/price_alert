@@ -5,7 +5,15 @@ from datetime import UTC, datetime
 from colorama import Fore, Style
 
 from price_alert.models import PriceAlert
-from price_alert.notifier import AlertDispatcher, JsonlNotifier, colorize_alert, format_alert
+from price_alert.notifier import (
+    MACOS_ALERT_SOUND,
+    MACOS_SOUND_PLAYER,
+    AlertDispatcher,
+    ConsoleNotifier,
+    JsonlNotifier,
+    colorize_alert,
+    format_alert,
+)
 
 
 def test_jsonl_notifier_writes_atr_alert(tmp_path):
@@ -75,6 +83,47 @@ def make_alert(symbol: str = "BTC_USDT") -> PriceAlert:
         volume_24h_quote=1_000_000_000,
         timestamp=datetime(2026, 1, 1, tzinfo=UTC),
     )
+
+
+def test_console_notifier_uses_afplay_on_macos(monkeypatch, capsys):
+    calls = []
+
+    class Process:
+        async def wait(self):
+            return 0
+
+    async def create_subprocess_exec(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Process()
+
+    monkeypatch.setattr("price_alert.notifier.sys.platform", "darwin")
+    monkeypatch.setattr("price_alert.notifier.asyncio.create_subprocess_exec", create_subprocess_exec)
+
+    asyncio.run(ConsoleNotifier(beep=True, colors=False).send(make_alert()))
+
+    assert calls[0][0] == (MACOS_SOUND_PLAYER, MACOS_ALERT_SOUND)
+    assert "\a" not in capsys.readouterr().out
+
+
+def test_console_notifier_keeps_terminal_bell_off_macos(monkeypatch, capsys):
+    monkeypatch.setattr("price_alert.notifier.sys.platform", "linux")
+
+    asyncio.run(ConsoleNotifier(beep=True, colors=False).send(make_alert()))
+
+    assert capsys.readouterr().out.startswith("\a[暴涨提醒]")
+
+
+def test_macos_sound_failure_does_not_hide_alert(monkeypatch, capsys, caplog):
+    async def create_subprocess_exec(*args, **kwargs):
+        raise OSError("afplay 不可用")
+
+    monkeypatch.setattr("price_alert.notifier.sys.platform", "darwin")
+    monkeypatch.setattr("price_alert.notifier.asyncio.create_subprocess_exec", create_subprocess_exec)
+
+    asyncio.run(ConsoleNotifier(beep=True, colors=False).send(make_alert()))
+
+    assert "[暴涨提醒]" in capsys.readouterr().out
+    assert "macOS 提示音播放失败" in caplog.text
 
 
 class RecordingNotifier:

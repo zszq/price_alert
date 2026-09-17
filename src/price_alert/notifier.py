@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import sys
 import urllib.request
 from collections.abc import Iterable
 from datetime import timedelta, timezone
@@ -20,6 +21,8 @@ from price_alert.models import PriceAlert
 
 LOGGER = logging.getLogger(__name__)
 BEIJING_TIME = timezone(timedelta(hours=8))
+MACOS_SOUND_PLAYER = "/usr/bin/afplay"
+MACOS_ALERT_SOUND = "/System/Library/Sounds/Glass.aiff"
 
 
 class Notifier(Protocol):
@@ -54,7 +57,27 @@ class ConsoleNotifier:
 
     async def send(self, alert: PriceAlert) -> None:
         text = colorize_alert(alert, format_alert(alert), self.colors)
-        print(("\a" if self.beep else "") + text, flush=True)
+        # macOS 终端通常会忽略或禁用 ASCII 响铃，直接播放系统音效才能稳定发声。
+        terminal_bell = "\a" if self.beep and sys.platform != "darwin" else ""
+        print(terminal_bell + text, flush=True)
+        if self.beep and sys.platform == "darwin":
+            await self._play_macos_sound()
+
+    @staticmethod
+    async def _play_macos_sound() -> None:
+        try:
+            process = await asyncio.create_subprocess_exec(
+                MACOS_SOUND_PLAYER,
+                MACOS_ALERT_SOUND,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            return_code = await process.wait()
+            if return_code != 0:
+                LOGGER.warning("macOS 提示音播放失败，afplay 退出码：%s", return_code)
+        except OSError as exc:
+            # 提示音失败不能吞掉已经输出的价格提醒，也不能中断该通知通道。
+            LOGGER.warning("macOS 提示音播放失败：%s", exc)
 
 
 class JsonlNotifier:
