@@ -54,7 +54,7 @@ class IndicatorConfig(BaseModel):
 class AlertConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    cooldown_seconds: int = Field(default=120, ge=0, le=86400)
+    cooldown_seconds: int = Field(default=30, ge=0, le=86400)
     console: bool = True
     console_colors: bool = True
     beep: bool = True

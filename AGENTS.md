@@ -52,7 +52,7 @@ python -m venv .venv
 
 - pydantic 模型全部 `extra="forbid"`，YAML 中出现未知键会直接报错。
 - `PRICE_ALERT_WEBHOOK_URL` 环境变量覆盖 `alerts.webhook_url`。
-- 代码中的默认值与 `config/default.yaml` 不一定一致（如 `cooldown_seconds` 代码默认 120，YAML 为 30；README 中仍写 120）。实际运行以 YAML 为准。
+- 代码默认值与 `config/default.yaml` 必须保持一致，并由配置测试校验；实际运行仍以 YAML 为准。
 
 ### 新增/修改检测参数时需要同步的位置
 

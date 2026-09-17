@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import pytest
 from pydantic import ValidationError
 
@@ -37,3 +39,11 @@ def test_noise_protection_defaults_are_enabled():
     assert config.indicator.trigger_atr_multiple == 1.5
     assert config.indicator.min_change_percent == 1.0
     assert config.indicator.confirmation_seconds == 3
+
+
+def test_code_defaults_match_default_yaml(monkeypatch):
+    # 清除外部覆盖，确保比较的是两套默认配置本身，而不是运行环境。
+    monkeypatch.delenv("PRICE_ALERT_WEBHOOK_URL", raising=False)
+    default_yaml = Path(__file__).resolve().parents[1] / "config" / "default.yaml"
+
+    assert AppConfig() == load_config(default_yaml)
