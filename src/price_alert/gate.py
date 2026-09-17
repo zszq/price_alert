@@ -87,7 +87,7 @@ class GateRestClient:
         query = f"?{urllib.parse.urlencode(params)}" if params else ""
         request = urllib.request.Request(  # noqa: S310 - 基础地址来自本地配置
             f"{self.base_url}{path}{query}",
-            headers={"Accept": "application/json", "User-Agent": "price-alert/1.0"},
+            headers={"Accept": "application/json", "User-Agent": "price_alert/1.0"},
         )
         for attempt in range(self.retries):
             is_last_attempt = attempt == self.retries - 1

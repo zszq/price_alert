@@ -1,4 +1,4 @@
-# Gate.io ATR Price Alert
+# price_alert
 
 一个只面向 Gate.io 虚拟币 USDT 永续合约的实时价格异动监控服务。股票、指数、外汇、贵金属和商品合约不会进入监控。项目只负责监控和提醒，不执行交易。
 
