@@ -26,6 +26,8 @@ class Candle:
             raise ValueError("K 线价格必须是大于 0 的有限数")
         if self.high < self.low:
             raise ValueError("K 线最高价不能低于最低价")
+        if not math.isfinite(self.quote_volume):
+            raise ValueError("K 线成交额必须是有限数")
 
 
 @dataclass(frozen=True, slots=True)

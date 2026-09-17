@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Iterable, Mapping
 from typing import Any
 
@@ -10,9 +11,11 @@ from price_alert.models import ContractTicker
 
 def _number(value: Any) -> float:
     try:
-        return float(value)
+        number = float(value)
     except (TypeError, ValueError):
         return 0.0
+    # inf 会让 "> 门槛" 恒为真而把异常合约放进合约池，统一按无效值处理。
+    return number if math.isfinite(number) else 0.0
 
 
 def select_liquid_contracts(

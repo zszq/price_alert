@@ -79,6 +79,8 @@ class _SymbolState:
     candidate_direction: Literal["surge", "drop"] | None = None
     candidate_seconds: int = 0
     candidate_last_second: datetime | None = None
+    # 断线期间的成交永久缺失，实时 K 线无法自行修复，必须等 REST 回补后才能再用 ATR 判定。
+    atr_stale: bool = False
 
 
 class AtrMoveDetector:
@@ -112,6 +114,10 @@ class AtrMoveDetector:
     def symbols(self) -> list[str]:
         return sorted(self._states)
 
+    @property
+    def stale_symbols(self) -> list[str]:
+        return sorted(symbol for symbol, state in self._states.items() if state.atr_stale)
+
     def add_symbol(
         self,
         symbol: str,
@@ -137,11 +143,52 @@ class AtrMoveDetector:
         for symbol in symbols:
             self._states.pop(symbol, None)
 
-    def reset_realtime(self) -> None:
-        """行情中断后调用：丢弃秒级窗口与确认进度，避免把断线前后的价格当作连续行情比较。"""
+    def mark_stream_gap(self) -> None:
+        """行情中断后调用：丢弃秒级窗口与确认进度，并暂停 ATR 判定直到 resync_symbol 回补 K 线。"""
         for state in self._states.values():
             state.buckets.clear()
             self._reset_candidate(state)
+            state.atr_stale = True
+
+    def resync_symbol(
+        self,
+        symbol: str,
+        candles: list[Candle],
+        live_candle: Candle | None,
+        fetched_at: datetime,
+    ) -> bool:
+        """用 REST K 线重建 ATR 与实时 K 线；合约已移除或已不需要回补时返回 False。"""
+        state = self._states.get(symbol.upper())
+        if state is None or not state.atr_stale:
+            # 回补期间合约可能被移出又以全新预热状态重新入池，此时不能用这批数据覆盖。
+            return False
+
+        seed = sorted(candles, key=lambda item: item.timestamp)
+        live_bar = state.live_bar
+        if live_candle is not None:
+            if live_bar is None or live_bar.timestamp < live_candle.timestamp:
+                # 本地实时 K 线停留在断线前的周期，整体换成交易所的当前 K 线。
+                live_bar = _LiveBar.from_candle(live_candle)
+            elif live_bar.timestamp == live_candle.timestamp:
+                # 本地 K 线含有请求返回后才到达的成交，交易所 K 线含有断线期间的成交，两者取并集才完整。
+                is_local_newer = state.last_tick_time is not None and state.last_tick_time > fetched_at
+                live_bar = _LiveBar(
+                    live_candle.timestamp,
+                    live_candle.open,
+                    max(live_bar.high, live_candle.high),
+                    min(live_bar.low, live_candle.low),
+                    live_bar.close if is_local_newer else live_candle.close,
+                )
+            else:
+                # 请求返回后本地已跨入新周期，交易所返回的“当前 K 线”其实已经收盘，应计入 ATR。
+                seed.append(live_candle)
+
+        atr = WilderAtr(self.atr_period)
+        atr.seed(candle for candle in seed if live_bar is None or candle.timestamp < live_bar.timestamp)
+        state.atr = atr
+        state.live_bar = live_bar
+        state.atr_stale = False
+        return True
 
     def add_tick(self, tick: PriceTick) -> list[PriceAlert]:
         symbol = tick.symbol.upper()
@@ -206,8 +253,24 @@ class AtrMoveDetector:
             state.live_bar.update(price)
             return
         if bar_timestamp > state.live_bar.timestamp:
-            state.atr.update(state.live_bar.to_candle())
+            if not state.atr_stale:
+                # 断线期间 ATR 等待 REST 重建，此时喂入缺口两侧的 K 线只会引入错误数据。
+                previous = state.live_bar.to_candle()
+                state.atr.update(previous)
+                self._fill_flat_bars(state, previous, bar_timestamp)
             state.live_bar = _LiveBar(bar_timestamp, price, price, price, price)
+
+    def _fill_flat_bars(self, state: _SymbolState, previous: Candle, next_bar: datetime) -> None:
+        # 连接正常时跨过的周期确实无人成交；Gate 对这类周期返回开高低收都等于上一收盘价的平线 K 线，
+        # 实时计算保持同样口径，ATR 才与预热数据一致，且冷门合约停摆后 ATR 时间戳不会被误判为过期。
+        missing = int((next_bar - previous.timestamp) / self._candle_interval) - 1
+        if missing <= 0:
+            return
+        # 连续平线让 Wilder ATR 按 (n-1)/n 几何衰减，4n 根后原值只剩约 2%，更早的平线无需逐根计算。
+        count = min(missing, self.atr_period * 4)
+        for offset in range(count, 0, -1):
+            flat_time = next_bar - self._candle_interval * offset
+            state.atr.update(Candle(flat_time, previous.close, previous.close, previous.close, previous.close))
 
     def _floor_time(self, timestamp: datetime) -> datetime:
         epoch = int(timestamp.timestamp())
@@ -223,7 +286,7 @@ class AtrMoveDetector:
     ) -> PriceAlert | None:
         atr = state.atr.value
         atr_timestamp = state.atr.last_timestamp
-        if atr is None or atr <= 0 or atr_timestamp is None:
+        if state.atr_stale or atr is None or atr <= 0 or atr_timestamp is None:
             self._reset_candidate(state)
             return None
         # K 线时间戳是开盘时间，按收盘时间计算年龄，配置值才等于“ATR 最近一次更新距今多久”。

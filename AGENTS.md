@@ -35,7 +35,7 @@ python -m venv .venv
 ### 服务主循环（service.py）
 
 - `run_monitor` 先用 `_initial_universe` 带退避地完成首次合约池初始化，然后在 `TaskGroup` 中并行跑两个互相独立的循环：`_universe_loop` 定期刷新合约池，`_stream_loop` 维持 WebSocket 长连接。合约池变化通过 `GateTradeFeed.set_symbols` 增量订阅/退订，**不会断线**。
-- `_stream_loop` 中任何异常（包括握手/TCP 超时抛出的 `TimeoutError`）都按故障处理：先 `detector.reset_realtime()` 清空秒级窗口，再按指数退避重连；收到第一笔成交后退避重置。`GateTradeFeed` 的接收超时被转换成 `ConnectionError`。
+- `_stream_loop` 中任何异常（包括握手/TCP 超时抛出的 `TimeoutError`）都按故障处理：先 `detector.mark_stream_gap()` 清空秒级窗口并把全部合约的 ATR 标记为失效，再按指数退避重连；收到第一笔成交后退避重置；若此前断过线，会再次 `mark_stream_gap()`（覆盖断线退避期间合约池刷新新增的合约），并在后台启动 `_resync_stale_symbols` 为失效合约回补 K 线（失败按退避重试，断线时取消）。回补必须在实时成交恢复后发起，这样请求前的缺口由 REST 覆盖、请求后的成交由实时流覆盖。`GateTradeFeed` 的接收超时被转换成 `ConnectionError`。
 - `GateTradeFeed` 的订阅请求带自增 `id`（Gate 会原样回传），Gate 一批中只要有一个无效合约就整批失败，所以批量失败时会逐个重订阅，被拒绝的合约记录在 `rejected_symbols`。订阅发送与集合变更由 `_subscription_lock` 串行化。
 - 单笔坏成交或无法解析的消息只跳过并限流打日志（`_ThrottledLogger`），不能向上抛出导致断线。
 - `_sync_universe` 做增量同步：移除的合约丢弃检测状态（冷却记录保留），保留的合约只更新成交额，新增合约并发（`warmup_concurrency`）拉 K 线预热；`_split_candles` 把已收盘 K 线用于 seed ATR，未收盘的当前 K 线作为 `live_candle` 初始化实时 K 线。预热失败的合约仍加入，靠实时 K 线自行就绪。
@@ -49,9 +49,9 @@ python -m venv .venv
 - 成交按秒聚合为 `_SecondBucket`（VWAP，零成交量时退化为算术均价）。**只有在下一秒的第一笔成交到达时才会评估刚结束的那一秒**，所以没有新成交就不会产生判定；测试和 `simulate` 都要多送一秒的成交来“结算”最后一个桶。
 - 两笔成交之间的空秒（不超过 `lookback_seconds` 个）会用最后成交价生成补齐桶（`_SecondBucket.carried`）并依次评估：补齐桶可以推进确认计数，但**只有真实成交的秒才能触发提醒**。空档更长则不补齐。
 - 乱序（时间早于上一笔）的成交直接丢弃。
-- ATR 由 `indicators.WilderAtr` 计算：预热 K 线 seed 后，实时成交维护 `_LiveBar`（可由 `live_candle` 初始化），跨入下一个 K 线周期时才把上一根 bar 喂给 ATR。ATR 年龄按最后计入 K 线的**收盘时间**（开盘时间 + 周期）计算，超过 `max_atr_age_seconds` 则不判定。
+- ATR 由 `indicators.WilderAtr` 计算：预热 K 线 seed 后，实时成交维护 `_LiveBar`（可由 `live_candle` 初始化），跨入下一个 K 线周期时才把上一根 bar 喂给 ATR；若跨过了多个周期，中间按 Gate 的口径补开高低收都等于上一收盘价的平线 K 线（最多 `atr_period × 4` 根）。ATR 年龄按最后计入 K 线的**收盘时间**（开盘时间 + 周期）计算，超过 `max_atr_age_seconds` 则不判定。
 - 触发条件（全部满足）：基准桶在 `lookback_seconds` 前且间隔不超过 lookback+2 秒；窗口内成交笔数 ≥ `min_window_trades`；`|涨跌幅| ≥ min_change_percent` **且** `位移/ATR ≥ trigger_atr_multiple`；同方向连续 `confirmation_seconds` 个相邻秒满足（任一条件不满足就重置候选）；同一合约不分方向的冷却期已过。
-- `remove_symbols` 不清除冷却记录；`reset_realtime` 只清空秒级窗口和确认进度，保留 ATR 与实时 K 线。
+- `remove_symbols` 不清除冷却记录。`mark_stream_gap` 清空秒级窗口和确认进度并置 `atr_stale`：失效期间不判定、不向 ATR 喂 K 线（也不补平线），直到 `resync_symbol` 用 REST K 线重建 ATR。重建时若本地实时 K 线与交易所当前 K 线同一周期，高低点取并集；若本地已跨入新周期，交易所的“当前 K 线”按已收盘计入 ATR。`resync_symbol` 只作用于仍处于失效状态的合约。
 
 ### 配置（config.py + config/default.yaml）
 

@@ -1,5 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from price_alert.detector import AtrMoveDetector
 from price_alert.models import Candle, PriceTick
 
@@ -173,14 +175,15 @@ def test_gap_longer_than_lookback_is_not_filled():
     assert alerts == []
 
 
-def test_reset_realtime_prevents_comparing_prices_across_disconnect():
+def test_stream_gap_prevents_comparing_prices_across_disconnect():
     instance = detector()
     instance.add_symbol("BTC_USDT", history(1.0), 1_000_000_000)
     start = BASE + timedelta(minutes=3)
     for second in range(11):
         instance.add_tick(PriceTick("BTC_USDT", 100.0, 1.0, start + timedelta(seconds=second)))
 
-    instance.reset_realtime()
+    instance.mark_stream_gap()
+    instance.resync_symbol("BTC_USDT", history(1.0), None, start + timedelta(seconds=10))
     alerts = []
     for second in range(11, 15):
         alerts.extend(instance.add_tick(PriceTick("BTC_USDT", 101.0, 1.0, start + timedelta(seconds=second))))
@@ -221,3 +224,98 @@ def test_cooldown_survives_symbol_leaving_and_rejoining_universe():
     instance.add_symbol("BTC_USDT", history(1.0), 1_000_000_000)
 
     assert feed_window_at(instance, "BTC_USDT", 99.0, BASE + timedelta(minutes=3, seconds=20)) == []
+
+
+def atr_of(instance: AtrMoveDetector, symbol: str):
+    # ATR 没有公开读取接口；K 线口径问题直接检查内部 ATR 最清楚，也不必借助整条提醒链路间接推断。
+    return instance._states[symbol].atr
+
+
+def test_stale_atr_pauses_detection_until_resynced():
+    instance = detector()
+    instance.add_symbol("BTC_USDT", history(1.0), 1_000_000_000)
+    instance.mark_stream_gap()
+    start = BASE + timedelta(minutes=3)
+
+    assert instance.stale_symbols == ["BTC_USDT"]
+    assert feed_window_at(instance, "BTC_USDT", 101.0, start) == []
+
+    assert instance.resync_symbol("BTC_USDT", history(1.0), None, start + timedelta(seconds=14)) is True
+    assert instance.stale_symbols == []
+    assert len(feed_window_at(instance, "BTC_USDT", 101.0, start + timedelta(seconds=20))) == 1
+
+
+def test_resync_ignores_unknown_or_already_fresh_symbols():
+    instance = detector()
+    instance.add_symbol("BTC_USDT", history(1.0), 1_000_000_000)
+
+    assert instance.resync_symbol("BTC_USDT", history(4.0), None, BASE) is False
+    assert instance.resync_symbol("ETH_USDT", history(4.0), None, BASE) is False
+    assert atr_of(instance, "BTC_USDT").value == 1.0
+
+
+def test_resync_merges_local_and_exchange_view_of_current_bar():
+    instance = detector()
+    instance.add_symbol("BTC_USDT", history(1.0), 1_000_000_000)
+    bar = BASE + timedelta(minutes=3)
+    # 断线前本地见到了 103 的高点，断线期间交易所记录了 96 的低点。
+    instance.add_tick(PriceTick("BTC_USDT", 103.0, 1.0, bar + timedelta(seconds=5)))
+    instance.mark_stream_gap()
+    instance.add_tick(PriceTick("BTC_USDT", 98.0, 1.0, bar + timedelta(seconds=50)))
+
+    exchange_bar = Candle(bar, 100.0, 101.0, 96.0, 97.0)
+    assert instance.resync_symbol("BTC_USDT", history(1.0), exchange_bar, bar + timedelta(seconds=40))
+    instance.add_tick(PriceTick("BTC_USDT", 98.0, 1.0, bar + timedelta(seconds=60)))
+
+    atr = atr_of(instance, "BTC_USDT")
+    # 合并 K 线高 103、低 96，TR=7，ATR=(1×2+7)/3。
+    assert atr.last_timestamp == bar
+    assert atr.value == pytest.approx(3.0)
+
+
+def test_resync_counts_exchange_current_bar_as_closed_after_local_rollover():
+    instance = detector()
+    instance.add_symbol("BTC_USDT", history(1.0), 1_000_000_000)
+    instance.mark_stream_gap()
+    bar = BASE + timedelta(minutes=3)
+    instance.add_tick(PriceTick("BTC_USDT", 100.0, 1.0, bar + timedelta(seconds=61)))
+
+    assert instance.resync_symbol(
+        "BTC_USDT",
+        history(1.0),
+        Candle(bar, 100.0, 104.0, 100.0, 100.0),
+        bar + timedelta(seconds=59),
+    )
+
+    atr = atr_of(instance, "BTC_USDT")
+    assert atr.last_timestamp == bar
+    assert atr.value == pytest.approx((1.0 * 2 + 4.0) / 3)
+
+
+def test_bars_without_trades_are_filled_with_flat_candles_like_gate():
+    instance = detector()
+    instance.add_symbol("BTC_USDT", history(1.0), 1_000_000_000)
+    bar = BASE + timedelta(minutes=3)
+    instance.add_tick(PriceTick("BTC_USDT", 100.0, 1.0, bar))
+    instance.add_tick(PriceTick("BTC_USDT", 100.0, 1.0, bar + timedelta(minutes=3)))
+
+    atr = atr_of(instance, "BTC_USDT")
+    # 03:00 的实时 K 线与 04:00、05:00 两根平线 TR 均为 0，ATR 每根衰减为 2/3。
+    assert atr.last_timestamp == BASE + timedelta(minutes=5)
+    assert atr.value == pytest.approx((2 / 3) ** 3)
+
+
+def test_flat_fill_is_capped_and_skipped_while_stale():
+    bar = BASE + timedelta(minutes=3)
+    capped = detector()
+    capped.add_symbol("BTC_USDT", history(1.0), 1_000_000_000)
+    capped.add_tick(PriceTick("BTC_USDT", 100.0, 1.0, bar))
+    capped.add_tick(PriceTick("BTC_USDT", 100.0, 1.0, bar + timedelta(minutes=1000)))
+    assert atr_of(capped, "BTC_USDT").last_timestamp == bar + timedelta(minutes=999)
+
+    stale = detector()
+    stale.add_symbol("BTC_USDT", history(1.0), 1_000_000_000)
+    stale.mark_stream_gap()
+    stale.add_tick(PriceTick("BTC_USDT", 100.0, 1.0, bar))
+    stale.add_tick(PriceTick("BTC_USDT", 100.0, 1.0, bar + timedelta(minutes=3)))
+    assert atr_of(stale, "BTC_USDT").last_timestamp == BASE + timedelta(minutes=2)

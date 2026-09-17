@@ -266,3 +266,11 @@ def test_receive_timeout_is_reported_as_connection_error():
 
     with pytest.raises(ConnectionError, match="未收到 Gate 行情"):
         asyncio.run(scenario())
+
+
+def test_rejects_non_finite_candle_values():
+    base = {"t": 1_700_000_000, "o": "100", "h": "102", "l": "99", "c": "101", "sum": "5000"}
+    for key in ("o", "h", "l", "c", "sum"):
+        for value in ("nan", "inf"):
+            with pytest.raises(ValueError):
+                parse_candle(base | {key: value})

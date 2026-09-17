@@ -57,6 +57,17 @@ def test_excludes_contract_when_classification_is_missing():
     assert selected == []
 
 
+def test_non_finite_exchange_numbers_are_treated_as_invalid():
+    tickers = [
+        {"contract": "INF_USDT", "last": "inf", "volume_24h_quote": "20000000"},
+        {"contract": "INFVOL_USDT", "last": "1", "volume_24h_quote": "inf"},
+        {"contract": "NAN_USDT", "last": "1", "volume_24h_quote": "nan"},
+    ]
+    contracts = [{"name": item["contract"], "contract_type": "", "status": "trading"} for item in tickers]
+
+    assert select_liquid_contracts(tickers, contracts, 10_000_000) == []
+
+
 def test_excludes_contracts_in_delisting():
     selected = select_liquid_contracts(
         [{"contract": "OLD_USDT", "last": "1", "volume_24h_quote": "20000000"}],

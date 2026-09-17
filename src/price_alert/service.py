@@ -45,6 +45,55 @@ def _split_candles(
     return closed, current
 
 
+async def _fetch_candles(
+    rest: GateRestClient,
+    symbol: str,
+    config: AppConfig,
+    semaphore: asyncio.Semaphore,
+) -> tuple[list[Candle], Candle | None, datetime]:
+    async with semaphore:
+        fetched = await asyncio.to_thread(
+            rest.fetch_candles,
+            symbol,
+            config.indicator.candle_interval,
+            config.indicator.warmup_candles,
+        )
+    fetched_at = datetime.now(UTC)
+    closed, live = _split_candles(fetched, INTERVAL_SECONDS[config.indicator.candle_interval], fetched_at)
+    return closed, live, fetched_at
+
+
+async def _resync_stale_symbols(detector: AtrMoveDetector, rest: GateRestClient, config: AppConfig) -> None:
+    """重连后为断线期间失效的合约回补 K 线并重建 ATR，失败的合约按退避重试直到全部完成。"""
+    semaphore = asyncio.Semaphore(config.gate.warmup_concurrency)
+    delay = config.gate.reconnect_initial_seconds
+    resynced = 0
+
+    async def resync(symbol: str) -> bool:
+        try:
+            closed, live, fetched_at = await _fetch_candles(rest, symbol, config, semaphore)
+        except Exception as exc:
+            LOGGER.warning("%s 断线后 K 线回补失败：%s", symbol, exc)
+            return False
+        detector.resync_symbol(symbol, closed, live, fetched_at)
+        return True
+
+    while True:
+        # 每轮重新读取：回补期间合约池刷新可能已移除部分合约。
+        symbols = detector.stale_symbols
+        if not symbols:
+            return
+        results = await asyncio.gather(*(resync(symbol) for symbol in symbols))
+        failed = results.count(False)
+        resynced += len(symbols) - failed
+        if not failed:
+            LOGGER.info("已为 %d 个合约回补 K 线并重建 ATR", resynced)
+            return
+        LOGGER.warning("%d 个合约 K 线回补失败，暂停其异动判定，%.1f 秒后重试", failed, delay)
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, config.gate.reconnect_max_seconds)
+
+
 async def _sync_universe(
     detector: AtrMoveDetector,
     rest: GateRestClient,
@@ -60,20 +109,12 @@ async def _sync_universe(
         detector.add_symbol(symbol, [], selected_by_symbol[symbol].volume_24h_quote)
 
     semaphore = asyncio.Semaphore(config.gate.warmup_concurrency)
-    interval_seconds = INTERVAL_SECONDS[config.indicator.candle_interval]
 
     async def add_new_symbol(symbol: str) -> None:
         closed: list[Candle] = []
         live: Candle | None = None
         try:
-            async with semaphore:
-                fetched = await asyncio.to_thread(
-                    rest.fetch_candles,
-                    symbol,
-                    config.indicator.candle_interval,
-                    config.indicator.warmup_candles,
-                )
-            closed, live = _split_candles(fetched, interval_seconds, datetime.now(UTC))
+            closed, live, _ = await _fetch_candles(rest, symbol, config, semaphore)
         except Exception as exc:
             # 单个新品种预热失败时仍加入监控，它会在实时 K 线积累后自行就绪。
             LOGGER.warning("%s ATR 预热失败：%s", symbol, exc)
@@ -148,18 +189,36 @@ async def _universe_loop(
             LOGGER.error("交易对池刷新失败：%s；%d 秒后重试", exc, delay)
 
 
+async def _stop_task(task: asyncio.Task[None] | None) -> None:
+    if task is None:
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        # 只吞掉被取消任务自身的取消；当前协程也在被取消时必须继续向上传播。
+        current = asyncio.current_task()
+        if current is not None and current.cancelling():
+            raise
+    except Exception as exc:
+        LOGGER.error("K 线回补任务异常退出：%s", exc)
+
+
 async def _stream_loop(
     detector: AtrMoveDetector,
     feed: GateTradeFeed,
+    rest: GateRestClient,
     dispatcher: AlertDispatcher,
     config: AppConfig,
 ) -> None:
     reconnect_delay = config.gate.reconnect_initial_seconds
     last_status = time.monotonic()
     tick_count = 0
+    had_stream_gap = False
 
     while True:
         connected = False
+        resync_task: asyncio.Task[None] | None = None
         LOGGER.info("连接 Gate.io 实时成交：%d 个合约", len(feed.symbols))
         try:
             # aclosing 保证循环体抛错时也会立即关闭 WebSocket，而不是等垃圾回收。
@@ -169,6 +228,14 @@ async def _stream_loop(
                         connected = True
                         reconnect_delay = config.gate.reconnect_initial_seconds
                         LOGGER.info("Gate.io 实时行情连接成功，已收到 %s 成交", tick.symbol)
+                        if had_stream_gap:
+                            # 断线退避期间合约池刷新新增的合约，其预热数据同样早于本次重连，需在此重新标记。
+                            detector.mark_stream_gap()
+                            # 必须在实时成交恢复之后再拉 K 线：请求之前的缺口由 REST 覆盖，之后的成交由实时流覆盖。
+                            resync_task = asyncio.create_task(
+                                _resync_stale_symbols(detector, rest, config),
+                                name="resync-stale-atr",
+                            )
                     tick_count += 1
                     for alert in detector.add_tick(tick):
                         dispatcher.publish(alert)
@@ -186,7 +253,11 @@ async def _stream_loop(
         except Exception as exc:
             # 连接、握手、网络超时都会走到这里；合约池刷新已与连接解耦，任何异常都按故障退避重连。
             LOGGER.warning("Gate.io 行情连接异常：%s；%.1f 秒后重连", exc, reconnect_delay)
-        detector.reset_realtime()
+        finally:
+            # 断线后本轮回补出的 K 线又会与新的缺口不一致，停止回补，等下次连接恢复后重新开始。
+            await _stop_task(resync_task)
+        detector.mark_stream_gap()
+        had_stream_gap = True
         await asyncio.sleep(reconnect_delay)
         reconnect_delay = min(reconnect_delay * 2, config.gate.reconnect_max_seconds)
 
@@ -208,4 +279,4 @@ async def run_monitor(config: AppConfig) -> None:
     async with AlertDispatcher(build_notifiers(config.alerts), config.alerts.queue_size) as dispatcher:
         async with asyncio.TaskGroup() as tasks:
             tasks.create_task(_universe_loop(detector, rest, feed, config))
-            tasks.create_task(_stream_loop(detector, feed, dispatcher, config))
+            tasks.create_task(_stream_loop(detector, feed, rest, dispatcher, config))

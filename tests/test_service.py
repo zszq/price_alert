@@ -35,17 +35,21 @@ def config() -> AppConfig:
 
 class FakeDetector:
     def __init__(self) -> None:
-        self.resets = 0
+        self.gaps = 0
 
     @property
     def symbols(self) -> list[str]:
         return ["BTC_USDT"]
 
+    @property
+    def stale_symbols(self) -> list[str]:
+        return ["BTC_USDT"] if self.gaps else []
+
     def add_tick(self, tick: PriceTick) -> list[str]:
         return [f"alert-{tick.trade_id}"]
 
-    def reset_realtime(self) -> None:
-        self.resets += 1
+    def mark_stream_gap(self) -> None:
+        self.gaps += 1
 
 
 class ScriptedFeed:
@@ -60,6 +64,10 @@ class ScriptedFeed:
         ticks, error = self.scripts.pop(0)
         for trade_id in ticks:
             yield PriceTick("BTC_USDT", 100.0, 1.0, BASE, trade_id)
+        # 让出一次事件循环，使连接期间启动的后台回补任务真正开始运行。
+        wakeup = asyncio.get_running_loop().create_future()
+        asyncio.get_running_loop().call_soon(wakeup.set_result, None)
+        await wakeup
         raise error
 
 
@@ -71,8 +79,20 @@ class FakeDispatcher:
         self.published.append(alert)
 
 
-def test_network_timeouts_use_backoff_and_reset_realtime_state(monkeypatch, caplog):
+def test_network_timeouts_use_backoff_mark_gap_and_resync_only_while_connected(monkeypatch, caplog):
     delays = record_sleeps(monkeypatch, limit=3)
+    resync_started: list[int] = []
+    resync_cancelled: list[int] = []
+
+    async def fake_resync(detector, rest, config):
+        resync_started.append(len(resync_started))
+        try:
+            await asyncio.get_running_loop().create_future()
+        except asyncio.CancelledError:
+            resync_cancelled.append(len(resync_cancelled))
+            raise
+
+    monkeypatch.setattr(service, "_resync_stale_symbols", fake_resync)
     detector, dispatcher = FakeDetector(), FakeDispatcher()
     feed = ScriptedFeed(
         [
@@ -84,11 +104,15 @@ def test_network_timeouts_use_backoff_and_reset_realtime_state(monkeypatch, capl
     )
 
     with pytest.raises(StopLoop):
-        asyncio.run(service._stream_loop(detector, feed, dispatcher, config()))
+        asyncio.run(service._stream_loop(detector, feed, object(), dispatcher, config()))
 
     # 第二次连接收到成交后退避重置为初始值。
     assert delays == [1, 1, 2]
-    assert detector.resets == 3
+    # 三次断线各标记一次，第二次连接恢复时再标记一次，覆盖断线期间新入池的合约。
+    assert detector.gaps == 4
+    # 只有第二次连接真正收到成交时才开始回补，且断线时回补被取消。
+    assert resync_started == [0]
+    assert resync_cancelled == [0]
     assert dispatcher.published == ["alert-1", "alert-2"]
     assert "timed out during opening handshake" in caplog.text
     assert "刷新周期" not in caplog.text
@@ -185,3 +209,68 @@ def test_initial_universe_retries_with_backoff(monkeypatch):
 
     assert delays == [1, 2, 4, 4]
     assert feed.symbols == ["BTC_USDT"]
+
+
+class CandleRest:
+    """按合约返回 K 线，可让指定合约前几次请求失败。"""
+
+    def __init__(self, candles, failures: dict[str, int] | None = None) -> None:
+        self.candles = candles
+        self.failures = dict(failures or {})
+        self.requests: list[str] = []
+
+    def fetch_candles(self, symbol, interval, limit):
+        self.requests.append(symbol)
+        if self.failures.get(symbol):
+            self.failures[symbol] -= 1
+            raise ConnectionError("candles down")
+        return self.candles
+
+
+def test_resync_rebuilds_stale_symbols_and_retries_failures(monkeypatch):
+    delays = record_sleeps(monkeypatch, limit=10)
+    app_config = config()
+    detector = service.build_detector(app_config)
+    now = datetime.now(UTC)
+    candles = [
+        Candle(now - timedelta(minutes=offset), 100, 101, 99, 100)
+        for offset in range(app_config.indicator.warmup_candles, -1, -1)
+    ]
+    for symbol in ("BTC_USDT", "ETH_USDT"):
+        detector.add_symbol(symbol, [], 1e9)
+    detector.mark_stream_gap()
+    rest = CandleRest(candles, failures={"ETH_USDT": 1})
+
+    asyncio.run(service._resync_stale_symbols(detector, rest, app_config))
+
+    assert detector.stale_symbols == []
+    # 第一轮 ETH 失败，只按退避重试仍然失效的合约。
+    assert sorted(rest.requests) == ["BTC_USDT", "ETH_USDT", "ETH_USDT"]
+    assert delays == [1]
+
+
+def test_symbols_added_during_disconnect_are_resynced_after_reconnect(monkeypatch):
+    record_sleeps(monkeypatch, limit=2)
+    app_config = config()
+    detector = service.build_detector(app_config)
+    detector.add_symbol("BTC_USDT", [], 1e9)
+    resynced_batches: list[list[str]] = []
+
+    async def fake_resync(detector, rest, config):
+        resynced_batches.append(detector.stale_symbols)
+
+    class AddsSymbolWhileDisconnected(ScriptedFeed):
+        async def stream(self):
+            if len(self.scripts) == 1:
+                # 模拟断线退避期间合约池刷新加入了新合约（预热早于重连）。
+                detector.add_symbol("NEW_USDT", [], 1e9)
+            async for tick in super().stream():
+                yield tick
+
+    monkeypatch.setattr(service, "_resync_stale_symbols", fake_resync)
+    feed = AddsSymbolWhileDisconnected([((), ConnectionError("down")), (("1",), ConnectionError("down again"))])
+
+    with pytest.raises(StopLoop):
+        asyncio.run(service._stream_loop(detector, feed, object(), FakeDispatcher(), app_config))
+
+    assert resynced_batches == [["BTC_USDT", "NEW_USDT"]]
