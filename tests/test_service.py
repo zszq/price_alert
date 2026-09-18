@@ -53,17 +53,23 @@ class FakeDetector:
 
 
 class ScriptedFeed:
-    """每次 stream() 依次执行一个脚本：先产出若干成交，再抛出指定异常。"""
+    """每次 stream() 依次执行一个脚本：先产出若干成交，再抛出指定异常。
 
-    def __init__(self, scripts) -> None:
+    成交时间戳取当前时间，避免被 _stream_loop 的滞后熔断当成积压数据断开；
+    需要构造滞后成交的用例传 lag_seconds。
+    """
+
+    def __init__(self, scripts, lag_seconds: float = 0.0) -> None:
         self.scripts = list(scripts)
+        self.lag_seconds = lag_seconds
         self.rejected_symbols: set[str] = set()
         self.symbols = ["BTC_USDT"]
 
     async def stream(self):
         ticks, error = self.scripts.pop(0)
+        timestamp = datetime.now(UTC) - timedelta(seconds=self.lag_seconds)
         for trade_id in ticks:
-            yield PriceTick("BTC_USDT", 100.0, 1.0, BASE, trade_id)
+            yield PriceTick("BTC_USDT", 100.0, 1.0, timestamp, trade_id)
         # 让出一次事件循环，使连接期间启动的后台回补任务真正开始运行。
         wakeup = asyncio.get_running_loop().create_future()
         asyncio.get_running_loop().call_soon(wakeup.set_result, None)
@@ -116,6 +122,53 @@ def test_network_timeouts_use_backoff_mark_gap_and_resync_only_while_connected(m
     assert dispatcher.published == ["alert-1", "alert-2"]
     assert "timed out during opening handshake" in caplog.text
     assert "刷新周期" not in caplog.text
+
+
+def test_first_stale_tick_breaks_before_publishing(monkeypatch, caplog):
+    """连接后的第一笔成交就滞后时必须立即熔断：不能留出放行积压成交的时间窗口。
+
+    刻意不替换单调时钟——按时间间隔抽查的实现会让首笔落进盲区，用跳变的假时钟
+    反而会掩盖它。
+    """
+    delays = record_sleeps(monkeypatch, limit=1)
+    detector, dispatcher = FakeDetector(), FakeDispatcher()
+    feed = ScriptedFeed([(("1", "2"), ConnectionError("unused"))], lag_seconds=30)
+
+    with pytest.raises(StopLoop):
+        asyncio.run(service._stream_loop(detector, feed, object(), dispatcher, config()))
+
+    assert "行情数据滞后" in caplog.text
+    assert "30.0 秒" in caplog.text
+    # 校验在判定之前，且首笔即熔断，超限的成交一笔都不会产生已经过期的提醒。
+    assert dispatcher.published == []
+    # 熔断走正常的断线路径：清空秒级窗口并按初始退避重连。
+    assert detector.gaps == 1
+    assert delays == [1]
+
+
+def test_backlog_burst_within_one_second_is_not_let_through(monkeypatch):
+    """同一秒内涌入的大批积压成交必须全部拦下，不能只抽查其中一笔。"""
+    record_sleeps(monkeypatch, limit=1)
+    detector, dispatcher = FakeDetector(), FakeDispatcher()
+    # 一次性给出 50 笔滞后成交，模拟积压排空时的突发。
+    feed = ScriptedFeed([(tuple(str(i) for i in range(50)), ConnectionError("unused"))], lag_seconds=30)
+
+    with pytest.raises(StopLoop):
+        asyncio.run(service._stream_loop(detector, feed, object(), dispatcher, config()))
+
+    assert dispatcher.published == []
+
+
+def test_fresh_market_data_does_not_trigger_lag_breaker(monkeypatch):
+    """数据新鲜时不得误断连接。"""
+    record_sleeps(monkeypatch, limit=1)
+    detector, dispatcher = FakeDetector(), FakeDispatcher()
+    feed = ScriptedFeed([(("1", "2", "3"), ConnectionError("down"))], lag_seconds=0)
+
+    with pytest.raises(StopLoop):
+        asyncio.run(service._stream_loop(detector, feed, object(), dispatcher, config()))
+
+    assert dispatcher.published == ["alert-1", "alert-2", "alert-3"]
 
 
 class FakeRest:

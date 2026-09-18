@@ -10,6 +10,7 @@ gate:
   warmup_concurrency: 8
   subscription_chunk_size: 100
   receive_timeout_seconds: 30
+  max_data_lag_seconds: 10
   reconnect_initial_seconds: 1
   reconnect_max_seconds: 30
   status_interval_seconds: 60

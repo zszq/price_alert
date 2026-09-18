@@ -223,7 +223,10 @@ class GateTradeFeed:
         async with self._connect(
             self.url,
             ping_interval=20,
-            ping_timeout=20,
+            # pong 与成交推送共用一条 TCP 流，链路拥塞时会被积压数据队头阻塞，RTT 可从
+            # 200 毫秒涨到二十几秒。超时放宽到 30 秒，把断线判定让给 _stream_loop 里按
+            # 成交时间戳做的滞后熔断（阈值更低、语义明确），keepalive 只兜底真正的死连接。
+            ping_timeout=30,
             close_timeout=5,
             max_queue=20_000,
         ) as websocket:

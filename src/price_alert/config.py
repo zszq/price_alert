@@ -27,6 +27,7 @@ class GateConfig(BaseModel):
     warmup_concurrency: int = Field(default=8, ge=1, le=32)
     subscription_chunk_size: int = Field(default=100, ge=1, le=500)
     receive_timeout_seconds: float = Field(default=30.0, gt=0, le=300)
+    max_data_lag_seconds: float = Field(default=10.0, gt=0, le=300)
     reconnect_initial_seconds: float = Field(default=1.0, gt=0, le=60)
     reconnect_max_seconds: float = Field(default=30.0, gt=0, le=300)
     status_interval_seconds: int = Field(default=60, gt=0, le=3600)

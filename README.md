@@ -119,6 +119,7 @@ $env:PRICE_ALERT_WEBHOOK_URL = "https://example.com/your-webhook"
 - `gate.universe_exit_volume_ratio`：已在监控中的合约的退出门槛比例，成交额低于 `min_volume_24h_quote × 该比例` 才移除，默认 0.8；
 - `gate.universe_refresh_seconds`：交易对池刷新周期；
 - `gate.reconnect_initial_seconds` / `gate.reconnect_max_seconds`：断线重连的指数退避初始值与上限，上限不能小于初始值；
+- `gate.max_data_lag_seconds`：实时成交的最大允许滞后，默认 10 秒。网络拥塞时成交会在链路上积压，推送过来的已是几十秒前的行情，此时秒级判定失去意义；逐笔校验成交时间戳，超过该值即主动断开重连以清空积压，滞后的成交在判定之前就被拦下，不会产生提醒。若日志频繁出现「行情数据滞后」，说明到 Gate 的网络链路不稳，应先排查网络而不是调高该值；
 - `indicator.candle_interval`：ATR K 线周期；
 - `indicator.atr_period`：Wilder ATR 周期；
 - `indicator.lookback_seconds`：短时位移观察窗口；

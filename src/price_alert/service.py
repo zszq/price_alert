@@ -236,10 +236,28 @@ async def _stream_loop(
                                 _resync_stale_symbols(detector, rest, config),
                                 name="resync-stale-atr",
                             )
+                    # 链路拥塞时成交会在网络中积压，推送的仍是几十秒前的行情：此时秒级判定
+                    # 已失去意义，提醒发出时价格早已改变。滞后超限就主动断开——重连能清空
+                    # 积压，也让日志直指真因，而不是等 keepalive 因 pong 被积压数据队头
+                    # 阻塞而报出含义不明的 1011。
+                    # 逐笔校验而不做节流：datetime.now 不到 1 微秒，相比 add_tick 可以忽略，
+                    # 按时间间隔抽查反而会留出放行积压成交的窗口。检查放在判定之前，超限的
+                    # 成交不再产生已经过期的提醒。
+                    # 注意这是全服务唯一拿本地时钟与交易所时间戳比较的地方（检测器只做
+                    # 时间戳之间的相对比较）：本地时钟若快于交易所超过阈值，会被误判为
+                    # 滞后而反复重连，此时应先校准系统时间而不是调高阈值。
+                    lag = (datetime.now(UTC) - tick.timestamp).total_seconds()
+                    if lag > config.gate.max_data_lag_seconds:
+                        raise ConnectionError(
+                            f"行情数据滞后 {lag:.1f} 秒（上限 {config.gate.max_data_lag_seconds:g} 秒），"
+                            "网络链路拥塞，主动重连以清空积压"
+                        )
+
                     tick_count += 1
+                    current_time = time.monotonic()
                     for alert in detector.add_tick(tick):
                         dispatcher.publish(alert)
-                    current_time = time.monotonic()
+
                     if current_time - last_status >= config.gate.status_interval_seconds:
                         rejected = len(feed.rejected_symbols)
                         LOGGER.info(
