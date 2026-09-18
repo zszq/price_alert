@@ -38,7 +38,7 @@ class IndicatorConfig(BaseModel):
     trigger_atr_multiple: float = Field(default=1.5, gt=0, le=20)
     min_change_percent: float = Field(default=1.0, gt=0, le=100)
     confirmation_seconds: int = Field(default=3, ge=1, le=10)
-    min_window_trades: int = Field(default=5, ge=1)
+    min_window_trades: int = Field(default=15, ge=1)
     max_atr_age_seconds: int = Field(default=180, ge=30, le=3600)
 
     @model_validator(mode="after")
