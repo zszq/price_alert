@@ -161,6 +161,44 @@ def test_single_wick_followed_by_silence_does_not_alert_from_carried_seconds():
     assert alerts == []
 
 
+def stale_second_settled_after_gap(settling_price: float) -> list:
+    """构造“异动秒之后出现空档，由一笔迟到的成交来结算它”的场景。
+
+    确认进度在空档中由补齐桶凑满，因此提醒只能由空档前那个真实秒产生，
+    而它的价格此时已经是 8 秒前的旧值。
+    """
+    instance = detector()
+    instance.add_symbol("THIN_USDT", history(1.0), 20_000_000)
+    start = BASE + timedelta(minutes=3)
+    for second in range(11):
+        instance.add_tick(PriceTick("THIN_USDT", 100.0, 1.0, start + timedelta(seconds=second)))
+
+    alerts = []
+    for second in (11, 12):
+        alerts.extend(instance.add_tick(PriceTick("THIN_USDT", 101.0, 1.0, start + timedelta(seconds=second))))
+    assert alerts == []
+    return instance.add_tick(PriceTick("THIN_USDT", settling_price, 1.0, start + timedelta(seconds=20)))
+
+
+def test_stale_second_is_not_alerted_when_settling_trade_shows_the_move_is_over():
+    # 结算这一秒的成交已经回到 100，异动在空档中就结束了，不能再按 101 发提醒。
+    assert stale_second_settled_after_gap(100.0) == []
+
+
+def test_stale_second_is_still_alerted_when_settling_trade_confirms_the_move():
+    # 同一条路径上价格仍在 101：空档后结算是稀疏合约唯一的提醒时机，不能一并拦掉。
+    alerts = stale_second_settled_after_gap(101.0)
+
+    assert len(alerts) == 1
+    assert alerts[0].direction == "surge"
+    assert alerts[0].price == 101.0
+
+
+def test_reversal_after_gap_does_not_alert_in_the_old_direction():
+    # 复核必须看方向：砸穿基准价的成交在幅度上同样超标，只比幅度会发出方向相反的提醒。
+    assert stale_second_settled_after_gap(98.0) == []
+
+
 def test_gap_longer_than_lookback_is_not_filled():
     instance = detector()
     instance.add_symbol("THIN_USDT", history(1.0), 20_000_000)

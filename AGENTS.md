@@ -48,6 +48,7 @@ python -m venv .venv
 
 - 成交按秒聚合为 `_SecondBucket`（VWAP，零成交量时退化为算术均价）。**只有在下一秒的第一笔成交到达时才会评估刚结束的那一秒**，所以没有新成交就不会产生判定；测试和 `simulate` 都要多送一秒的成交来“结算”最后一个桶。
 - 两笔成交之间的空秒（不超过 `lookback_seconds` 个）会用最后成交价生成补齐桶（`_SecondBucket.carried`）并依次评估：补齐桶可以推进确认计数，但**只有真实成交的秒才能触发提醒**。空档更长则不补齐。
+- 空档前那个真实秒是被迟到的成交结算的，它的 VWAP 已经过期，因此还要用这笔成交价按同一套门槛（`_exceeds_thresholds`）复核方向与幅度（`_still_moving`），不成立就只推进确认计数、不提醒——否则价格已回落时仍会发出携带旧价格的提醒。紧邻结算只迟一秒，不复核，以免新一秒的单笔离群成交否掉本该发出的提醒。
 - 乱序（时间早于上一笔）的成交直接丢弃。
 - ATR 由 `indicators.WilderAtr` 计算：预热 K 线 seed 后，实时成交维护 `_LiveBar`（可由 `live_candle` 初始化），跨入下一个 K 线周期时才把上一根 bar 喂给 ATR；若跨过了多个周期，中间按 Gate 的口径补开高低收都等于上一收盘价的平线 K 线（最多 `atr_period × 4` 根）。ATR 年龄按最后计入 K 线的**收盘时间**（开盘时间 + 周期）计算，超过 `max_atr_age_seconds` 则不判定。
 - 触发条件（全部满足）：基准桶在 `lookback_seconds` 前且间隔不超过 lookback+2 秒；窗口内成交笔数 ≥ `min_window_trades`；`|涨跌幅| ≥ min_change_percent` **且** `位移/ATR ≥ trigger_atr_multiple`；同方向连续 `confirmation_seconds` 个相邻秒满足（任一条件不满足就重置候选）；同一合约不分方向的冷却期已过。

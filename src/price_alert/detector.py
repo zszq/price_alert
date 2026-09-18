@@ -211,9 +211,11 @@ class AtrMoveDetector:
         alerts: list[PriceAlert] = []
         if state.buckets:
             completed = state.buckets[-1]
-            # 等一秒结束后再使用整秒 VWAP，避免把新一秒的第一笔成交误当成稳定价格。
-            self._settle(symbol, state, completed, timestamp, alerts)
             missing_seconds = int((second - completed.timestamp).total_seconds()) - 1
+            # 等一秒结束后再使用整秒 VWAP，避免把新一秒的第一笔成交误当成稳定价格。
+            # 空档后才结算的秒，其 VWAP 已是几秒甚至几十秒前的旧价格，必须用当前成交价复核；
+            # 紧邻结算只迟一秒，不复核，以免新一秒的单笔离群成交否掉本该发出的提醒。
+            self._settle(symbol, state, completed, timestamp, alerts, tick.price if missing_seconds > 0 else None)
             # 稀疏合约在快速行情中常有空秒，沿用最后成交价补齐才能完成连续确认；
             # 空档超过观察窗口说明行情停滞，补齐已无比较意义。
             if 0 < missing_seconds <= self.lookback_seconds:
@@ -222,7 +224,8 @@ class AtrMoveDetector:
                 for offset in range(1, missing_seconds + 1):
                     filler = _SecondBucket.carried(completed.timestamp + timedelta(seconds=offset), last_price)
                     state.buckets.append(filler)
-                    self._settle(symbol, state, filler, timestamp, alerts)
+                    # 补齐桶本就不能触发提醒，无需复核。
+                    self._settle(symbol, state, filler, timestamp, alerts, None)
 
         current = _SecondBucket(second)
         current.add(tick.price, tick.size)
@@ -236,11 +239,12 @@ class AtrMoveDetector:
         bucket: _SecondBucket,
         timestamp: datetime,
         alerts: list[PriceAlert],
+        latest_price: float | None,
     ) -> None:
         oldest_required = bucket.timestamp - timedelta(seconds=self.lookback_seconds)
         while len(state.buckets) > 2 and state.buckets[1].timestamp <= oldest_required:
             state.buckets.popleft()
-        alert = self._evaluate(symbol, state, bucket, timestamp)
+        alert = self._evaluate(symbol, state, bucket, timestamp, latest_price)
         if alert is not None:
             alerts.append(alert)
 
@@ -283,7 +287,9 @@ class AtrMoveDetector:
         state: _SymbolState,
         current: _SecondBucket,
         timestamp: datetime,
+        latest_price: float | None,
     ) -> PriceAlert | None:
+        """评估一个已结束的秒；latest_price 非空时还需该价格仍满足门槛才允许提醒。"""
         atr = state.atr.value
         atr_timestamp = state.atr.last_timestamp
         if state.atr_stale or atr is None or atr <= 0 or atr_timestamp is None:
@@ -314,10 +320,7 @@ class AtrMoveDetector:
             return None
 
         price_move = current.price - baseline.price
-        change_percent = price_move / baseline.price * 100.0
-        move_atr = abs(price_move) / atr
-        # 两道门槛必须同时满足：百分比保证肉眼可感知，ATR 倍数适配不同市场波动率。
-        if abs(change_percent) < self.min_change_percent or move_atr < self.trigger_atr_multiple:
+        if not self._exceeds_thresholds(price_move, baseline.price, atr):
             self._reset_candidate(state)
             return None
 
@@ -326,6 +329,11 @@ class AtrMoveDetector:
             return None
         if not current.has_trades:
             # 补齐的空秒只延续确认进度，不能单独触发：否则一笔离群成交后恰好无人成交也会被当成持续异动。
+            return None
+        if latest_price is not None and not self._still_moving(latest_price, baseline.price, atr, direction):
+            # 这一秒是在空档之后才被结算的，它的价格已经过期，而触发结算的那笔成交是此刻唯一的
+            # 价格证据：它若已不满足门槛，说明异动在空档中就结束了，再按旧价格提醒只会误导。
+            # 同样只拦提醒、不重置确认进度，与上面补齐桶的处理保持一致。
             return None
 
         previous_alert = self._last_alert.get(symbol)
@@ -340,8 +348,8 @@ class AtrMoveDetector:
             direction=direction,
             price=current.price,
             reference_price=baseline.price,
-            change_percent=change_percent,
-            move_atr=move_atr,
+            change_percent=price_move / baseline.price * 100.0,
+            move_atr=abs(price_move) / atr,
             atr=atr,
             atr_period=self.atr_period,
             lookback_seconds=self.lookback_seconds,
@@ -349,6 +357,27 @@ class AtrMoveDetector:
             volume_24h_quote=state.volume_24h_quote,
             timestamp=timestamp,
         )
+
+    def _exceeds_thresholds(self, price_move: float, baseline_price: float, atr: float) -> bool:
+        # 两道门槛必须同时满足：百分比保证肉眼可感知，ATR 倍数适配不同市场波动率。
+        # 判定与空档后的复核共用这一份规则，避免两处阈值逐渐走偏。
+        return (
+            abs(price_move / baseline_price * 100.0) >= self.min_change_percent
+            and abs(price_move) / atr >= self.trigger_atr_multiple
+        )
+
+    def _still_moving(
+        self,
+        latest_price: float,
+        baseline_price: float,
+        atr: float,
+        direction: Literal["surge", "drop"],
+    ) -> bool:
+        price_move = latest_price - baseline_price
+        # 反向必须单独判断：仅看幅度的话，暴涨过后直接砸穿基准价也能满足门槛而发出暴涨提醒。
+        if (price_move > 0) != (direction == "surge"):
+            return False
+        return self._exceeds_thresholds(price_move, baseline_price, atr)
 
     def _confirm_candidate(
         self,
