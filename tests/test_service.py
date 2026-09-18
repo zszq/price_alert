@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -157,6 +158,26 @@ def test_backlog_burst_within_one_second_is_not_let_through(monkeypatch):
         asyncio.run(service._stream_loop(detector, feed, object(), dispatcher, config()))
 
     assert dispatcher.published == []
+
+
+def test_persistent_lag_keeps_backing_off(monkeypatch, caplog):
+    """每次重连的首笔都滞后时（拥塞未缓解或本地时钟偏移）退避必须继续增长。
+
+    滞后的成交不算连接可用的证据，否则退避被反复重置，会变成每秒一次重连、
+    每次都重新订阅全部合约，把已经拥塞的链路压得更死。
+    """
+    # “连接成功”是 INFO，caplog 默认只收 WARNING 及以上，不降级这条断言就永远为真。
+    caplog.set_level(logging.INFO, logger="price_alert.service")
+    delays = record_sleeps(monkeypatch, limit=3)
+    detector, dispatcher = FakeDetector(), FakeDispatcher()
+    feed = ScriptedFeed([(("1",), ConnectionError("unused"))] * 3, lag_seconds=30)
+
+    with pytest.raises(StopLoop):
+        asyncio.run(service._stream_loop(detector, feed, object(), dispatcher, config()))
+
+    # 一直没有可用行情，不应报出“连接成功”。
+    assert "连接成功" not in caplog.text
+    assert delays == [1, 2, 4]
 
 
 def test_fresh_market_data_does_not_trigger_lag_breaker(monkeypatch):
