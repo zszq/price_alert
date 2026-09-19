@@ -23,7 +23,7 @@ indicator:
   trigger_atr_multiple: 1.5
   min_change_percent: 1.0
   confirmation_seconds: 3
-  min_window_trades: 15
+  min_window_trades: 10
   max_atr_age_seconds: 180
 
 alerts:
