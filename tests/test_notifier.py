@@ -69,6 +69,16 @@ def test_drop_alert_is_red():
     assert colorize_alert(alert, "drop") == f"{Fore.RED}drop{Style.RESET_ALL}"
 
 
+def test_colorize_highlights_symbol():
+    alert = make_alert("ETH_USDT")
+
+    text = colorize_alert(alert, "[暴涨提醒] | ETH_USDT | 价格上涨")
+
+    symbol = f"{Fore.LIGHTYELLOW_EX}ETH_USDT{Style.RESET_ALL}{Fore.GREEN}"
+    assert text == f"{Fore.GREEN}[暴涨提醒] | {symbol} | 价格上涨{Style.RESET_ALL}"
+    assert colorize_alert(alert, "ETH_USDT", enabled=False) == "ETH_USDT"
+
+
 def make_alert(symbol: str = "BTC_USDT") -> PriceAlert:
     return PriceAlert(
         symbol=symbol,

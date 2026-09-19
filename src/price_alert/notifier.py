@@ -44,7 +44,10 @@ def colorize_alert(alert: PriceAlert, text: str, enabled: bool = True) -> str:
     if not enabled:
         return text
     color = Fore.GREEN if alert.direction == "surge" else Fore.RED
-    return f"{color}{text}{Style.RESET_ALL}"
+    # 交易对用与涨跌红绿都不冲突的亮黄色（非加粗）突出，便于在连续提醒中快速定位币种；
+    # 标记结束后重新套上方向色，保证后半段文本颜色不丢。
+    symbol = f"{Fore.LIGHTYELLOW_EX}{alert.symbol}{Style.RESET_ALL}{color}"
+    return f"{color}{text.replace(alert.symbol, symbol, 1)}{Style.RESET_ALL}"
 
 
 class ConsoleNotifier:
