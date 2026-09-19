@@ -3,12 +3,14 @@ gate:
   websocket_url: wss://fx-ws.gateio.ws/v4/ws/usdt
   settle: usdt
   min_volume_24h_quote: 10000000
+  universe_exit_volume_ratio: 0.8
   universe_refresh_seconds: 600
   rest_timeout_seconds: 15
   rest_retries: 3
   warmup_concurrency: 8
   subscription_chunk_size: 100
   receive_timeout_seconds: 30
+  max_data_lag_seconds: 10
   reconnect_initial_seconds: 1
   reconnect_max_seconds: 30
   status_interval_seconds: 60
@@ -26,9 +28,12 @@ indicator:
 
 alerts:
   cooldown_seconds: 30
+  queue_size: 1000
   console: true
   console_colors: true
   beep: true
   jsonl_path: data/alerts/alerts.jsonl
+  jsonl_max_bytes: 10000000
+  jsonl_backup_count: 5
   webhook_url: null
   webhook_timeout_seconds: 5

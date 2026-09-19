@@ -34,37 +34,44 @@ python -m venv .venv
 
 ### 服务主循环（service.py）
 
-- 合约池刷新与 WebSocket 会话是绑定的：每个 WS 会话被 `asyncio.timeout(距下次刷新的秒数)` 包住，超时即断开、重新筛选合约、按新合约列表重新连接订阅。因此 `except TimeoutError` 表示“到达刷新周期”而不是故障。
-- 为了不与上面混淆，`GateTradeFeed` 内部的接收超时被转换成 `ConnectionError`，走指数退避重连分支。修改超时处理时要保持这种区分。
-- `_sync_universe` 做增量同步：移除的合约丢弃状态（含冷却记录），保留的合约只更新成交额，新增合约并发（`warmup_concurrency`）拉 K 线预热，且会剔除尚未收盘的当前 K 线。预热失败的合约仍加入，靠实时 K 线自行就绪。
-- `GateRestClient` 是同步 `urllib` 实现，异步代码中通过 `asyncio.to_thread` 调用。
+- `run_monitor` 先用 `_initial_universe` 带退避地完成首次合约池初始化，然后在 `TaskGroup` 中并行跑两个互相独立的循环：`_universe_loop` 定期刷新合约池，`_stream_loop` 维持 WebSocket 长连接。合约池变化通过 `GateTradeFeed.set_symbols` 增量订阅/退订，**不会断线**。
+- `_stream_loop` 中任何异常（包括握手/TCP 超时抛出的 `TimeoutError`）都按故障处理：先 `detector.mark_stream_gap()` 清空秒级窗口并把全部合约的 ATR 标记为失效，再按指数退避重连；收到第一笔成交后退避重置；若此前断过线，会再次 `mark_stream_gap()`（覆盖断线退避期间合约池刷新新增的合约），并在后台启动 `_resync_stale_symbols` 为失效合约回补 K 线（失败按退避重试，断线时取消）。回补必须在实时成交恢复后发起，这样请求前的缺口由 REST 覆盖、请求后的成交由实时流覆盖。`GateTradeFeed` 的接收超时被转换成 `ConnectionError`。
+- `GateTradeFeed` 的订阅请求带自增 `id`（Gate 会原样回传），Gate 一批中只要有一个无效合约就整批失败，所以批量失败时会逐个重订阅，被拒绝的合约记录在 `rejected_symbols`。订阅发送与集合变更由 `_subscription_lock` 串行化。
+- 单笔坏成交或无法解析的消息只跳过并限流打日志（`_ThrottledLogger`），不能向上抛出导致断线。
+- `_sync_universe` 做增量同步：移除的合约丢弃检测状态（冷却记录保留），保留的合约只更新成交额，新增合约并发（`warmup_concurrency`）拉 K 线预热；`_split_candles` 把已收盘 K 线用于 seed ATR，未收盘的当前 K 线作为 `live_candle` 初始化实时 K 线。预热失败的合约仍加入，靠实时 K 线自行就绪。
+- 提醒通过 `AlertDispatcher.publish` 非阻塞投递，每个通道独立队列和后台任务，绝不能在成交循环里 `await` 通知发送。
+- `GateRestClient` 是同步 `urllib` 实现，异步代码中通过 `asyncio.to_thread` 调用。只重试 408/429/5xx 与网络/读取/JSON 解析类临时错误，其他 4xx 直接抛出。
 
 ### 检测器（detector.py）
 
 每个合约一个 `_SymbolState`，核心语义：
 
 - 成交按秒聚合为 `_SecondBucket`（VWAP，零成交量时退化为算术均价）。**只有在下一秒的第一笔成交到达时才会评估刚结束的那一秒**，所以没有新成交就不会产生判定；测试和 `simulate` 都要多送一秒的成交来“结算”最后一个桶。
+- 两笔成交之间的空秒（不超过 `lookback_seconds` 个）会用最后成交价生成补齐桶（`_SecondBucket.carried`）并依次评估：补齐桶可以推进确认计数，但**只有真实成交的秒才能触发提醒**。空档更长则不补齐。
+- 空档前那个真实秒是被迟到的成交结算的，它的 VWAP 已经过期，因此还要用这笔成交价按同一套门槛（`_exceeds_thresholds`）复核方向与幅度（`_still_moving`），不成立就只推进确认计数、不提醒——否则价格已回落时仍会发出携带旧价格的提醒。紧邻结算只迟一秒，不复核，以免新一秒的单笔离群成交否掉本该发出的提醒。
 - 乱序（时间早于上一笔）的成交直接丢弃。
-- ATR 由 `indicators.WilderAtr` 计算：预热 K 线 seed 后，实时成交维护 `_LiveBar`，跨入下一个 K 线周期时才把上一根 bar 喂给 ATR。ATR 超过 `max_atr_age_seconds` 未更新则不判定。
-- 触发条件（全部满足）：基准桶在 `lookback_seconds` 前且间隔不超过 lookback+2 秒；窗口内成交笔数 ≥ `min_window_trades`；`|涨跌幅| ≥ min_change_percent` **且** `位移/ATR ≥ trigger_atr_multiple`；同方向连续 `confirmation_seconds` 个相邻秒满足（中间缺一秒或任一条件不满足就重置候选）；同一合约不分方向的冷却期已过。
+- ATR 由 `indicators.WilderAtr` 计算：预热 K 线 seed 后，实时成交维护 `_LiveBar`（可由 `live_candle` 初始化），跨入下一个 K 线周期时才把上一根 bar 喂给 ATR；若跨过了多个周期，中间按 Gate 的口径补开高低收都等于上一收盘价的平线 K 线（最多 `atr_period × 4` 根）。ATR 年龄按最后计入 K 线的**收盘时间**（开盘时间 + 周期）计算，超过 `max_atr_age_seconds` 则不判定。
+- 触发条件（全部满足）：基准桶在 `lookback_seconds` 前且间隔不超过 lookback+2 秒；窗口内成交笔数 ≥ `min_window_trades`；`|涨跌幅| ≥ min_change_percent` **且** `位移/ATR ≥ trigger_atr_multiple`；同方向连续 `confirmation_seconds` 个相邻秒满足（任一条件不满足就重置候选）；同一合约不分方向的冷却期已过。
+- `remove_symbols` 不清除冷却记录。`mark_stream_gap` 清空秒级窗口和确认进度并置 `atr_stale`：失效期间不判定、不向 ATR 喂 K 线（也不补平线），直到 `resync_symbol` 用 REST K 线重建 ATR。重建时若本地实时 K 线与交易所当前 K 线同一周期，高低点取并集；若本地已跨入新周期，交易所的“当前 K 线”按已收盘计入 ATR。`resync_symbol` 只作用于仍处于失效状态的合约。
 
 ### 配置（config.py + config/default.yaml）
 
 - pydantic 模型全部 `extra="forbid"`，YAML 中出现未知键会直接报错。
 - `PRICE_ALERT_WEBHOOK_URL` 环境变量覆盖 `alerts.webhook_url`。
 - 代码默认值与 `config/default.yaml` 必须保持一致，并由配置测试校验；实际运行仍以 YAML 为准。
+- `IndicatorConfig` 校验：`warmup_candles > atr_period`、`confirmation_seconds ≤ lookback_seconds`、`max_atr_age_seconds ≥ 2 个 K 线周期`（未显式设置时自动取 3 个周期）。`GateConfig` 校验 `reconnect_max_seconds ≥ reconnect_initial_seconds`。
 
 ### 新增/修改检测参数时需要同步的位置
 
-`AtrMoveDetector` 的构造参数在两处被手工组装：`service.py::run_monitor` 和 `cli.py::simulate`。新增指标参数需要同时改 `config.py` 模型、`config/default.yaml`、这两处构造、README 的配置说明。K 线周期到秒数的映射在 `service.INTERVAL_SECONDS` 和 `IndicatorConfig` 校验器中各有一份。
+`AtrMoveDetector` 统一由 `service.build_detector` 组装（`run_monitor` 和 `cli.simulate` 共用）。新增指标参数需要同时改 `config.py` 模型、`config/default.yaml`、`build_detector`、README 的配置说明。K 线周期到秒数的映射只有 `config.INTERVAL_SECONDS` 一份。
 
 ### 合约池筛选（universe.py）
 
-只接受 `contract_type == ""`（字段必须存在且为空，非币类资产会有分类值）、`status == "trading"`、以 `_USDT` 结尾、`volume_24h_quote` **严格大于**门槛的合约。`volume_24h_usd` 已被 Gate 弃用，仅作缺字段时的回退。`is_internal=true` 的成交在 `gate.parse_trade_payload` 中被忽略。
+只接受 `contract_type == ""`（字段必须存在且为空，非币类资产会有分类值）、`status == "trading"`、`in_delisting` 不为真、以 `_USDT` 结尾、`volume_24h_quote` **严格大于**门槛的合约。已在监控中的合约（`retained_symbols`）使用 `门槛 × universe_exit_volume_ratio` 作为退出门槛。`volume_24h_usd` 已被 Gate 弃用，仅作缺字段时的回退。`is_internal=true` 的成交在 `gate.parse_trade_payload` 中被忽略。
 
 ### 通知（notifier.py）
 
-`NotifierHub` 用 `gather(return_exceptions=True)` 并发发送，单个通道失败只记日志不影响监控。提醒时间统一转为北京时间；控制台暴涨绿色、暴跌红色；JSONL/Webhook 保留完整结构化字段（`PriceAlert.to_dict()`）。修改提醒文本格式时注意 README 中的示例。
+`AlertDispatcher` 为每个通道建立独立的有界队列（`alerts.queue_size`）和后台任务：`publish` 非阻塞，队列满时丢弃并记错误日志；单个通道失败只记日志；退出时最多等待 `drain_timeout` 秒把积压发完。`build_notifiers` 按配置返回通道列表。`JsonlNotifier` 按 `jsonl_max_bytes` 整文件轮转。提醒时间统一转为北京时间；控制台暴涨绿色、暴跌红色；JSONL/Webhook 保留完整结构化字段（`PriceAlert.to_dict()`）。修改提醒文本格式时注意 README 中的示例。
 
 ## 约定
 

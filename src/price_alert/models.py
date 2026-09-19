@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from typing import Literal
@@ -19,10 +20,14 @@ class Candle:
     def __post_init__(self) -> None:
         if self.timestamp.tzinfo is None:
             raise ValueError("timestamp 必须包含时区")
-        if min(self.open, self.high, self.low, self.close) <= 0:
-            raise ValueError("K 线价格必须大于 0")
+        prices = (self.open, self.high, self.low, self.close)
+        # NaN 与任何数比较都为假，必须显式检查有限性，否则会绕过正数校验污染 ATR。
+        if not all(math.isfinite(price) for price in prices) or min(prices) <= 0:
+            raise ValueError("K 线价格必须是大于 0 的有限数")
         if self.high < self.low:
             raise ValueError("K 线最高价不能低于最低价")
+        if not math.isfinite(self.quote_volume):
+            raise ValueError("K 线成交额必须是有限数")
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,10 +39,10 @@ class PriceTick:
     trade_id: str | None = None
 
     def __post_init__(self) -> None:
-        if self.price <= 0:
-            raise ValueError("price 必须大于 0")
-        if self.size < 0:
-            raise ValueError("size 不能小于 0")
+        if not math.isfinite(self.price) or self.price <= 0:
+            raise ValueError("price 必须是大于 0 的有限数")
+        if not math.isfinite(self.size) or self.size < 0:
+            raise ValueError("size 必须是不小于 0 的有限数")
         if self.timestamp.tzinfo is None:
             raise ValueError("timestamp 必须包含时区")
 
