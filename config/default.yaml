@@ -7,6 +7,8 @@ gate:
   universe_refresh_seconds: 600
   rest_timeout_seconds: 15
   rest_retries: 3
+  rest_rate_limit_per_second: 10
+  rest_rate_limit_burst: 20
   warmup_concurrency: 8
   subscription_chunk_size: 100
   receive_timeout_seconds: 30

@@ -1,7 +1,11 @@
 import asyncio
+import email.parser
+import email.utils
+import http.client
 import io
 import json
 import urllib.error
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -102,7 +106,7 @@ class ResetResponse(FakeResponse):
         raise ConnectionResetError("reset while reading body")
 
 
-def rest_with_responses(monkeypatch, responses):
+def rest_with_responses(monkeypatch, responses, sleeps=None, rate_limiter=None):
     calls = []
 
     def fake_urlopen(request, timeout):
@@ -112,13 +116,17 @@ def rest_with_responses(monkeypatch, responses):
             raise result
         return result
 
+    def fake_sleep(seconds):
+        if sleeps is not None:
+            sleeps.append(seconds)
+
     monkeypatch.setattr(gate.urllib.request, "urlopen", fake_urlopen)
-    monkeypatch.setattr(gate.time, "sleep", lambda seconds: None)
-    return GateRestClient("https://example.test", retries=3), calls
+    monkeypatch.setattr(gate.time, "sleep", fake_sleep)
+    return GateRestClient("https://example.test", retries=3, rate_limiter=rate_limiter), calls
 
 
-def http_error(code: int) -> urllib.error.HTTPError:
-    return urllib.error.HTTPError("https://example.test", code, "error", {}, None)
+def http_error(code: int, headers: dict | None = None) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError("https://example.test", code, "error", headers or {}, None)
 
 
 def test_rest_does_not_retry_client_errors(monkeypatch):
@@ -274,3 +282,216 @@ def test_rejects_non_finite_candle_values():
         for value in ("nan", "inf"):
             with pytest.raises(ValueError):
                 parse_candle(base | {key: value})
+
+
+class FrozenClock:
+    """时钟不随 sleep 前进，用于模拟多个线程在同一时刻并发取令牌。"""
+
+    def __init__(self) -> None:
+        self.sleeps: list[float] = []
+
+    def monotonic(self) -> float:
+        return 0.0
+
+    def time(self) -> float:
+        return 0.0
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+
+
+class SteppingClock(FrozenClock):
+    """sleep 按时长推进时钟，用于模拟单线程顺序取令牌。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.now = 0.0
+
+    def monotonic(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.now += seconds
+
+
+def test_rate_limiter_passes_burst_then_queues_waiters(monkeypatch):
+    clock = FrozenClock()
+    monkeypatch.setattr(gate, "time", clock)
+    limiter = gate.RateLimiter(10, burst=2)
+
+    for _ in range(5):
+        limiter.acquire()
+
+    # 前两次用掉突发额度不等待；其余三次必须排成递增的等待，而不是睡同样长后一起醒来抢令牌。
+    assert clock.sleeps == [pytest.approx(0.1), pytest.approx(0.2), pytest.approx(0.3)]
+
+
+def test_rate_limiter_refills_tokens_over_time(monkeypatch):
+    clock = SteppingClock()
+    monkeypatch.setattr(gate, "time", clock)
+    limiter = gate.RateLimiter(10, burst=2)
+
+    for _ in range(4):
+        limiter.acquire()
+    clock.now += 1.0  # 静置 1 秒足够把桶重新充满
+    limiter.acquire()
+    limiter.acquire()
+
+    # 突发额度恢复后又能连放两次，长期速率仍被锁定在 10 次/秒。
+    assert clock.sleeps == [pytest.approx(0.1), pytest.approx(0.1)]
+
+
+def test_rate_limiter_rejects_non_positive_rate():
+    with pytest.raises(ValueError):
+        gate.RateLimiter(0)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("7", 7.0),
+        ("0", 0.0),
+        ("-5", 0.0),  # 负数按"立即可重试"处理
+        ("999999", gate.MAX_RETRY_AFTER_SECONDS),  # 异常大的值必须封顶
+        ("nan", None),
+        ("下周二", None),
+        (None, None),
+    ],
+)
+def test_retry_after_parses_seconds_and_rejects_garbage(raw, expected):
+    assert gate._retry_after_seconds({"Retry-After": raw} if raw is not None else {}) == expected
+
+
+def test_retry_after_parses_http_date():
+    future = email.utils.format_datetime(datetime.now(UTC) + timedelta(seconds=12))
+
+    assert gate._retry_after_seconds({"Retry-After": future}) == pytest.approx(12, abs=2)
+
+    # -0000 表示时区未知，解析结果是 naive datetime，少了补 UTC 这一步就会因为无法与 aware
+    # 的当前时间相减而抛 TypeError。用"未来 20 秒"而不是写死的远期日期，测试才不会到期失效。
+    unknown_zone = (datetime.now(UTC) + timedelta(seconds=20)).strftime("%a, %d %b %Y %H:%M:%S -0000")
+    assert gate._retry_after_seconds({"Retry-After": unknown_zone}) == pytest.approx(20, abs=2)
+
+
+def test_rest_waits_exactly_as_long_as_retry_after(monkeypatch):
+    sleeps: list[float] = []
+    client, calls = rest_with_responses(
+        monkeypatch,
+        [http_error(429, {"Retry-After": "7"}), FakeResponse(b"[]")],
+        sleeps=sleeps,
+    )
+
+    assert client.fetch_tickers() == []
+    assert len(calls) == 2
+    assert sleeps == [7.0]
+
+
+def test_rest_backs_off_longer_for_rate_limit_without_retry_after(monkeypatch):
+    sleeps: list[float] = []
+    client, _ = rest_with_responses(monkeypatch, [http_error(429)] * 3, sleeps=sleeps)
+
+    with pytest.raises(urllib.error.HTTPError):
+        client.fetch_tickers()
+
+    # 限频恢复以秒计，退避基数必须明显长于普通临时故障，否则重试只是继续踩在限频上。
+    assert sleeps == [2.0, 4.0]
+
+
+def test_rest_keeps_short_backoff_for_transient_failures(monkeypatch):
+    sleeps: list[float] = []
+    client, _ = rest_with_responses(monkeypatch, [http_error(503)] * 3, sleeps=sleeps)
+
+    with pytest.raises(urllib.error.HTTPError):
+        client.fetch_contracts()
+
+    assert sleeps == [0.5, 1.0]
+
+
+def test_rest_takes_a_token_for_every_attempt_including_retries(monkeypatch):
+    class CountingLimiter:
+        def __init__(self) -> None:
+            self.acquired = 0
+
+        def acquire(self) -> None:
+            self.acquired += 1
+
+    limiter = CountingLimiter()
+    client, calls = rest_with_responses(
+        monkeypatch,
+        [http_error(429), http_error(503), FakeResponse(b"[]")],
+        rate_limiter=limiter,
+    )
+
+    assert client.fetch_tickers() == []
+    # 重试若绕过限速，就会在最该收敛的时刻额外加码请求。
+    assert limiter.acquired == len(calls) == 3
+
+
+def test_rate_limit_reset_header_is_converted_to_remaining_seconds():
+    reset_at = datetime.now(UTC).timestamp() + 9
+
+    seconds = gate._rate_limit_reset_seconds({gate.RATE_LIMIT_RESET_HEADER: str(int(reset_at))})
+
+    assert seconds == pytest.approx(9, abs=2)
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("0", 0.0),  # 时间戳早已过去：限频窗口已重置，可以立即重试
+        ("99999999999", gate.MAX_RETRY_AFTER_SECONDS),  # 异常大的时间戳必须封顶
+        ("nan", None),
+        ("很快", None),
+        (None, None),
+    ],
+)
+def test_rate_limit_reset_header_rejects_garbage(raw, expected):
+    headers = {gate.RATE_LIMIT_RESET_HEADER: raw} if raw is not None else {}
+
+    assert gate._rate_limit_reset_seconds(headers) == expected
+
+
+def test_rest_waits_until_gate_rate_limit_resets(monkeypatch):
+    """Gate 不返回标准的 Retry-After，限频恢复时刻只在这个专有头里。"""
+    sleeps: list[float] = []
+    reset_at = int(datetime.now(UTC).timestamp() + 6)
+    client, calls = rest_with_responses(
+        monkeypatch,
+        [http_error(429, {gate.RATE_LIMIT_RESET_HEADER: str(reset_at)}), FakeResponse(b"[]")],
+        sleeps=sleeps,
+    )
+
+    assert client.fetch_tickers() == []
+    assert len(calls) == 2
+    assert sleeps == [pytest.approx(6, abs=2)]
+
+
+def test_standard_retry_after_takes_precedence_over_gate_header(monkeypatch):
+    sleeps: list[float] = []
+    reset_at = int(datetime.now(UTC).timestamp() + 1)
+    client, _ = rest_with_responses(
+        monkeypatch,
+        [
+            http_error(429, {"Retry-After": "8", gate.RATE_LIMIT_RESET_HEADER: str(reset_at)}),
+            FakeResponse(b"[]"),
+        ],
+        sleeps=sleeps,
+    )
+
+    assert client.fetch_tickers() == []
+    # 标准头语义更权威：两者冲突时按它等待，而不是取更短的那个继续踩限频。
+    assert sleeps == [8.0]
+
+
+def test_rate_limit_headers_are_read_case_insensitively():
+    """HTTP/2 的头名一律小写，而真实的 HTTPError.headers 是大小写不敏感的 HTTPMessage。
+
+    其余用例为了简洁用普通 dict 传头（大小写敏感），这里用真实类型锁住生产路径的取值行为。
+    """
+    raw = "x-gate-ratelimit-reset-timestamp: 99999999999\r\nx-gate-ratelimit-limit: 200\r\n\r\n"
+    headers = email.parser.Parser(_class=http.client.HTTPMessage).parsestr(raw)
+
+    exc = urllib.error.HTTPError("https://example.test", 429, "too many", headers, None)
+
+    assert GateRestClient("https://example.test")._retry_delay(0, exc) == gate.MAX_RETRY_AFTER_SECONDS

@@ -13,7 +13,7 @@ import yaml
 from pydantic import ValidationError
 
 from price_alert.config import INTERVAL_SECONDS, AppConfig, load_config
-from price_alert.gate import GateRestClient
+from price_alert.gate import GateRestClient, RateLimiter
 from price_alert.instance import AlreadyRunningError, ProcessLock
 from price_alert.models import Candle, PriceTick
 from price_alert.notifier import ConsoleNotifier
@@ -103,6 +103,7 @@ def print_universe(config: AppConfig) -> None:
         config.gate.settle,
         config.gate.rest_timeout_seconds,
         config.gate.rest_retries,
+        RateLimiter(config.gate.rest_rate_limit_per_second, config.gate.rest_rate_limit_burst),
     )
     selected = select_liquid_contracts(
         rest.fetch_tickers(),

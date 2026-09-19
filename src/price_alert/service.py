@@ -10,7 +10,7 @@ from datetime import UTC, datetime
 
 from price_alert.config import INTERVAL_SECONDS, AppConfig
 from price_alert.detector import AtrMoveDetector
-from price_alert.gate import GateRestClient, GateTradeFeed
+from price_alert.gate import GateRestClient, GateTradeFeed, RateLimiter
 from price_alert.models import Candle, ContractTicker
 from price_alert.notifier import AlertDispatcher, build_notifiers
 from price_alert.universe import select_liquid_contracts
@@ -63,9 +63,13 @@ async def _fetch_candles(
     return closed, live, fetched_at
 
 
-async def _resync_stale_symbols(detector: AtrMoveDetector, rest: GateRestClient, config: AppConfig) -> None:
+async def _resync_stale_symbols(
+    detector: AtrMoveDetector,
+    rest: GateRestClient,
+    config: AppConfig,
+    semaphore: asyncio.Semaphore,
+) -> None:
     """重连后为断线期间失效的合约回补 K 线并重建 ATR，失败的合约按退避重试直到全部完成。"""
-    semaphore = asyncio.Semaphore(config.gate.warmup_concurrency)
     delay = config.gate.reconnect_initial_seconds
     resynced = 0
 
@@ -99,6 +103,7 @@ async def _sync_universe(
     rest: GateRestClient,
     selected: list[ContractTicker],
     config: AppConfig,
+    semaphore: asyncio.Semaphore,
 ) -> None:
     selected_by_symbol = {ticker.symbol: ticker for ticker in selected}
     current = set(detector.symbols)
@@ -107,8 +112,6 @@ async def _sync_universe(
 
     for symbol in current & target:
         detector.add_symbol(symbol, [], selected_by_symbol[symbol].volume_24h_quote)
-
-    semaphore = asyncio.Semaphore(config.gate.warmup_concurrency)
 
     async def add_new_symbol(symbol: str) -> None:
         closed: list[Candle] = []
@@ -128,6 +131,7 @@ async def _refresh_universe(
     rest: GateRestClient,
     feed: GateTradeFeed,
     config: AppConfig,
+    semaphore: asyncio.Semaphore,
 ) -> list[ContractTicker]:
     raw_tickers, raw_contracts = await asyncio.gather(
         asyncio.to_thread(rest.fetch_tickers),
@@ -142,7 +146,7 @@ async def _refresh_universe(
     )
     if not selected:
         raise RuntimeError("Gate.io 没有满足成交额条件的可用虚拟币合约")
-    await _sync_universe(detector, rest, selected, config)
+    await _sync_universe(detector, rest, selected, config, semaphore)
     # 先完成预热再订阅，新合约的第一笔实时成交到达时 ATR 已经就绪。
     await feed.set_symbols(detector.symbols)
     LOGGER.info(
@@ -158,11 +162,12 @@ async def _initial_universe(
     rest: GateRestClient,
     feed: GateTradeFeed,
     config: AppConfig,
+    semaphore: asyncio.Semaphore,
 ) -> None:
     delay = config.gate.reconnect_initial_seconds
     while True:
         try:
-            await _refresh_universe(detector, rest, feed, config)
+            await _refresh_universe(detector, rest, feed, config, semaphore)
             return
         except Exception as exc:
             LOGGER.error("交易对池初始化失败：%s；%.1f 秒后重试", exc, delay)
@@ -175,13 +180,14 @@ async def _universe_loop(
     rest: GateRestClient,
     feed: GateTradeFeed,
     config: AppConfig,
+    semaphore: asyncio.Semaphore,
 ) -> None:
     refresh_seconds = config.gate.universe_refresh_seconds
     delay = refresh_seconds
     while True:
         await asyncio.sleep(delay)
         try:
-            await _refresh_universe(detector, rest, feed, config)
+            await _refresh_universe(detector, rest, feed, config, semaphore)
             delay = refresh_seconds
         except Exception as exc:
             # 刷新失败时沿用现有合约池继续监控，稍后重试即可，不影响实时连接。
@@ -210,6 +216,7 @@ async def _stream_loop(
     rest: GateRestClient,
     dispatcher: AlertDispatcher,
     config: AppConfig,
+    semaphore: asyncio.Semaphore,
 ) -> None:
     reconnect_delay = config.gate.reconnect_initial_seconds
     last_status = time.monotonic()
@@ -252,7 +259,7 @@ async def _stream_loop(
                             detector.mark_stream_gap()
                             # 必须在实时成交恢复之后再拉 K 线：请求之前的缺口由 REST 覆盖，之后的成交由实时流覆盖。
                             resync_task = asyncio.create_task(
-                                _resync_stale_symbols(detector, rest, config),
+                                _resync_stale_symbols(detector, rest, config, semaphore),
                                 name="resync-stale-atr",
                             )
 
@@ -290,14 +297,17 @@ async def run_monitor(config: AppConfig) -> None:
         config.gate.settle,
         config.gate.rest_timeout_seconds,
         config.gate.rest_retries,
+        RateLimiter(config.gate.rest_rate_limit_per_second, config.gate.rest_rate_limit_burst),
     )
     feed = GateTradeFeed(
         config.gate.websocket_url,
         config.gate.subscription_chunk_size,
         config.gate.receive_timeout_seconds,
     )
-    await _initial_universe(detector, rest, feed, config)
+    # 合约池刷新与断线回补共用一个信号量：两个循环并行运行，各自持有一个的话峰值并发会翻倍。
+    warmup_semaphore = asyncio.Semaphore(config.gate.warmup_concurrency)
+    await _initial_universe(detector, rest, feed, config, warmup_semaphore)
     async with AlertDispatcher(build_notifiers(config.alerts), config.alerts.queue_size) as dispatcher:
         async with asyncio.TaskGroup() as tasks:
-            tasks.create_task(_universe_loop(detector, rest, feed, config))
-            tasks.create_task(_stream_loop(detector, feed, rest, dispatcher, config))
+            tasks.create_task(_universe_loop(detector, rest, feed, config, warmup_semaphore))
+            tasks.create_task(_stream_loop(detector, feed, rest, dispatcher, config, warmup_semaphore))
