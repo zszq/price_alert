@@ -41,12 +41,13 @@ def test_noise_protection_defaults_are_enabled():
     assert config.indicator.confirmation_seconds == 3
 
 
-def test_code_defaults_match_default_yaml(monkeypatch):
-    # 清除外部覆盖，确保比较的是两套默认配置本身，而不是运行环境。
+def test_default_yaml_passes_validation(monkeypatch):
+    # default.yaml 的取值允许偏离代码默认值（运营随时调参），但仍须能通过校验，
+    # 否则未知键或越界值要等到启动服务时才暴露。
     monkeypatch.delenv("PRICE_ALERT_WEBHOOK_URL", raising=False)
     default_yaml = Path(__file__).resolve().parents[1] / "config" / "default.yaml"
 
-    assert AppConfig() == load_config(default_yaml)
+    load_config(default_yaml)
 
 
 def test_rejects_reconnect_max_below_initial_delay():

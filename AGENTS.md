@@ -58,7 +58,8 @@ python -m venv .venv
 
 - pydantic 模型全部 `extra="forbid"`，YAML 中出现未知键会直接报错。
 - `PRICE_ALERT_WEBHOOK_URL` 环境变量覆盖 `alerts.webhook_url`。
-- 代码默认值与 `config/default.yaml` 必须保持一致，并由配置测试校验；实际运行仍以 YAML 为准。
+- `config.py` 中的代码默认值固定不变，没有特别要求不要改；它只在 YAML 缺少对应项时生效，实际运行以 YAML 为准。
+- `config/default.yaml` 每项注释中的「默认 X」标注的是代码默认值。调参时只改 YAML 的取值，注释里的默认值和 `config.py` 都不动，两者允许不一致；配置测试只校验 YAML 能通过校验。
 - `IndicatorConfig` 校验：`warmup_candles > atr_period`、`confirmation_seconds ≤ lookback_seconds`、`max_atr_age_seconds ≥ 2 个 K 线周期`（未显式设置时自动取 3 个周期）。`GateConfig` 校验 `reconnect_max_seconds ≥ reconnect_initial_seconds`。
 
 ### 新增/修改检测参数时需要同步的位置
