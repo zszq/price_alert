@@ -1,14 +1,18 @@
 import asyncio
 import contextlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from colorama import Fore, Style
 
 from price_alert.models import PriceAlert
 from price_alert.notifier import (
+    DROP_CHANGE_COLOR,
     MACOS_ALERT_SOUND,
     MACOS_SOUND_PLAYER,
+    SURGE_CHANGE_COLOR,
+    SYMBOL_COLOR,
     AlertDispatcher,
     ConsoleNotifier,
     JsonlNotifier,
@@ -74,9 +78,22 @@ def test_colorize_highlights_symbol():
 
     text = colorize_alert(alert, "[暴涨提醒] | ETH_USDT | 价格上涨")
 
-    symbol = f"{Fore.LIGHTYELLOW_EX}ETH_USDT{Style.RESET_ALL}{Fore.GREEN}"
+    symbol = f"{SYMBOL_COLOR}ETH_USDT{Style.RESET_ALL}{Fore.GREEN}"
     assert text == f"{Fore.GREEN}[暴涨提醒] | {symbol} | 价格上涨{Style.RESET_ALL}"
     assert colorize_alert(alert, "ETH_USDT", enabled=False) == "ETH_USDT"
+
+
+def test_colorize_highlights_change_percent():
+    surge = make_alert()
+    text = colorize_alert(surge, "价格上涨 1.00% | 100 → 101")
+    change = f"{SURGE_CHANGE_COLOR}1.00%{Style.RESET_ALL}{Fore.GREEN}"
+    assert text == f"{Fore.GREEN}价格上涨 {change} | 100 → 101{Style.RESET_ALL}"
+
+    # 暴跌时 change_percent 为负，文本中显示绝对值，着色也要匹配到绝对值。
+    drop = replace(make_alert(), direction="drop", price=99.0, change_percent=-1.0)
+    text = colorize_alert(drop, "价格下跌 1.00% | 100 → 99")
+    change = f"{DROP_CHANGE_COLOR}1.00%{Style.RESET_ALL}{Fore.RED}"
+    assert text == f"{Fore.RED}价格下跌 {change} | 100 → 99{Style.RESET_ALL}"
 
 
 def make_alert(symbol: str = "BTC_USDT") -> PriceAlert:

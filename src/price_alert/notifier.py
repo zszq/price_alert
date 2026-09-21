@@ -23,6 +23,11 @@ LOGGER = logging.getLogger(__name__)
 BEIJING_TIME = timezone(timedelta(hours=8))
 MACOS_SOUND_PLAYER = "/usr/bin/afplay"
 MACOS_ALERT_SOUND = "/System/Library/Sounds/Glass.aiff"
+# 交易对用与涨跌红绿都不冲突的亮黄色（非加粗）突出，便于在连续提醒中快速定位币种。
+SYMBOL_COLOR = Fore.LIGHTYELLOW_EX
+# 涨跌幅高亮只用终端标准 16 色，保证各终端都能显示；取正文方向色的亮色版本。
+SURGE_CHANGE_COLOR = Fore.LIGHTGREEN_EX
+DROP_CHANGE_COLOR = Fore.LIGHTRED_EX
 
 
 class Notifier(Protocol):
@@ -35,19 +40,27 @@ def format_alert(alert: PriceAlert) -> str:
     occurred_at = alert.timestamp.astimezone(BEIJING_TIME).strftime("%Y-%m-%d %H:%M:%S")
     return (
         f"[{label}提醒] {occurred_at} | {alert.symbol} | {alert.lookback_seconds}秒内价格{move_label} "
-        f"{abs(alert.change_percent):.2f}% | {alert.reference_price:g} → {alert.price:g}"
+        f"{format_change(alert)} | {alert.reference_price:g} → {alert.price:g}"
         f" | 异动强度 {alert.move_atr:.2f} ATR"
     )
+
+
+def format_change(alert: PriceAlert) -> str:
+    # format_alert 与 colorize_alert 共用同一格式，保证着色时能在文本中准确找到百分比。
+    return f"{abs(alert.change_percent):.2f}%"
 
 
 def colorize_alert(alert: PriceAlert, text: str, enabled: bool = True) -> str:
     if not enabled:
         return text
     color = Fore.GREEN if alert.direction == "surge" else Fore.RED
-    # 交易对用与涨跌红绿都不冲突的亮黄色（非加粗）突出，便于在连续提醒中快速定位币种；
+    bright = SURGE_CHANGE_COLOR if alert.direction == "surge" else DROP_CHANGE_COLOR
     # 标记结束后重新套上方向色，保证后半段文本颜色不丢。
-    symbol = f"{Fore.LIGHTYELLOW_EX}{alert.symbol}{Style.RESET_ALL}{color}"
-    return f"{color}{text.replace(alert.symbol, symbol, 1)}{Style.RESET_ALL}"
+    symbol = f"{SYMBOL_COLOR}{alert.symbol}{Style.RESET_ALL}{color}"
+    change = format_change(alert)
+    highlighted_change = f"{bright}{change}{Style.RESET_ALL}{color}"
+    text = text.replace(alert.symbol, symbol, 1).replace(change, highlighted_change, 1)
+    return f"{color}{text}{Style.RESET_ALL}"
 
 
 class ConsoleNotifier:
