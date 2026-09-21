@@ -72,7 +72,7 @@ python -m venv .venv
 
 ### 通知（notifier.py）
 
-`AlertDispatcher` 为每个通道建立独立的有界队列（`alerts.queue_size`）和后台任务：`publish` 非阻塞，队列满时丢弃并记错误日志；单个通道失败只记日志；退出时最多等待 `drain_timeout` 秒把积压发完。`build_notifiers` 按配置返回通道列表。`JsonlNotifier` 按 `jsonl_max_bytes` 整文件轮转。提醒时间统一转为北京时间；控制台暴涨绿色、暴跌红色；JSONL/Webhook 保留完整结构化字段（`PriceAlert.to_dict()`）。修改提醒文本格式时注意 README 中的示例。
+`AlertDispatcher` 为每个通道建立独立的有界队列（`alerts.queue_size`）和后台任务：`publish` 非阻塞，队列满时丢弃并记错误日志；单个通道失败只记日志；退出时最多等待 `drain_timeout` 秒把积压发完。`build_notifiers` 按配置返回通道列表。`JsonlNotifier` 按 `jsonl_max_bytes` 整文件轮转。提醒时间统一转为北京时间；控制台急涨绿色、急跌红色；JSONL/Webhook 保留完整结构化字段（`PriceAlert.to_dict()`）。修改提醒文本格式时注意 README 中的示例。
 
 ## 约定
 

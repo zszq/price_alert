@@ -93,10 +93,10 @@ Windows 可以双击 `start-monitor.bat`，或者运行：
 ## 提醒示例
 
 ```text
-[暴涨提醒] 2026-09-16 16:20:30 | BTC_USDT | 30秒内价格上涨 1.24% | 75800 → 76739.92 | 异动强度 2.84 ATR
+[急涨提醒] 2026-09-16 16:20:30 | BTC_USDT | 30秒内价格上涨 1.24% | 75800 → 76739.92 | 异动强度 2.84 ATR
 ```
 
-提醒时间使用北京时间，格式为 `YYYY-MM-DD HH:MM:SS`。控制台中暴涨提醒显示为绿色，暴跌提醒显示为红色，交易对以亮黄色突出，涨跌幅百分比以同方向的亮绿/亮红色突出；`alerts.beep` 开启时，macOS 使用系统 `Glass` 音效，其他平台使用终端响铃。文本明确显示价格涨跌百分比，不显示原始 ATR 数值和 24 小时成交额。JSONL 和 Webhook 记录仍保留完整结构化字段，并包含值为 `green` 或 `red` 的 `color` 字段。
+提醒时间使用北京时间，格式为 `YYYY-MM-DD HH:MM:SS`。控制台中急涨提醒显示为绿色，急跌提醒显示为红色，交易对以亮黄色突出，涨跌幅百分比以同方向的亮绿/亮红色突出；`alerts.beep` 开启时，macOS 使用系统 `Glass` 音效，其他平台使用终端响铃。文本明确显示价格涨跌百分比，不显示原始 ATR 数值和 24 小时成交额。JSONL 和 Webhook 记录仍保留完整结构化字段，并包含值为 `green` 或 `red` 的 `color` 字段。
 
 实时提醒默认追加到 `data/alerts/alerts.jsonl`。每行是一条完整 JSON，即使程序异常退出，也不会破坏之前的记录。文件超过 `alerts.jsonl_max_bytes` 后整体轮转为 `alerts.jsonl.1`、`alerts.jsonl.2` 等，最多保留 `alerts.jsonl_backup_count` 个历史文件。
 

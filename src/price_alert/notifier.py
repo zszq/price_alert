@@ -35,7 +35,7 @@ class Notifier(Protocol):
 
 
 def format_alert(alert: PriceAlert) -> str:
-    label = "暴涨" if alert.direction == "surge" else "暴跌"
+    label = "急涨" if alert.direction == "surge" else "急跌"
     move_label = "上涨" if alert.direction == "surge" else "下跌"
     occurred_at = alert.timestamp.astimezone(BEIJING_TIME).strftime("%Y-%m-%d %H:%M:%S")
     return (
