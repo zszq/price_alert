@@ -13,6 +13,7 @@ from datetime import timedelta, timezone
 from pathlib import Path
 from types import TracebackType
 from typing import Protocol
+from urllib.parse import quote
 
 from colorama import Fore, Style, just_fix_windows_console
 
@@ -77,8 +78,10 @@ class ConsoleNotifier:
 
     async def send(self, alert: PriceAlert) -> None:
         text = colorize_alert(alert, format_alert(alert), self.colors)
+        # 完整网址独占一行且不着色，便于终端自动识别链接，不支持点击时也能直接复制。
+        trade_url = f"https://www.gate.com/zh/futures/USDT/{quote(alert.symbol, safe='')}"
         terminal_bell = "\a" if self.beep and not self._system_sound else ""
-        print(terminal_bell + text, flush=True)
+        print(f"{terminal_bell}{text}\n交易地址：{trade_url}", flush=True)
         # 音效约 1.65 秒，等待播完会让集中异动时的文字提醒逐条排队延迟，所以放到后台；
         # 上一次仍在播放时直接跳过，一波异动只响一次。
         if self._system_sound and (self._sound_task is None or self._sound_task.done()):
