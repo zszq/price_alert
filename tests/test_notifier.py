@@ -1,14 +1,18 @@
 import asyncio
 import contextlib
 import json
+from dataclasses import replace
 from datetime import UTC, datetime
 
 from colorama import Fore, Style
 
 from price_alert.models import PriceAlert
 from price_alert.notifier import (
+    DROP_CHANGE_COLOR,
     MACOS_ALERT_SOUND,
     MACOS_SOUND_PLAYER,
+    SURGE_CHANGE_COLOR,
+    SYMBOL_COLOR,
     AlertDispatcher,
     ConsoleNotifier,
     JsonlNotifier,
@@ -67,6 +71,29 @@ def test_drop_alert_is_red():
     assert alert.to_dict()["color"] == "red"
     assert "价格下跌 1.00%" in format_alert(alert)
     assert colorize_alert(alert, "drop") == f"{Fore.RED}drop{Style.RESET_ALL}"
+
+
+def test_colorize_highlights_symbol():
+    alert = make_alert("ETH_USDT")
+
+    text = colorize_alert(alert, "[急涨提醒] | ETH_USDT | 价格上涨")
+
+    symbol = f"{SYMBOL_COLOR}ETH_USDT{Style.RESET_ALL}{Fore.GREEN}"
+    assert text == f"{Fore.GREEN}[急涨提醒] | {symbol} | 价格上涨{Style.RESET_ALL}"
+    assert colorize_alert(alert, "ETH_USDT", enabled=False) == "ETH_USDT"
+
+
+def test_colorize_highlights_change_percent():
+    surge = make_alert()
+    text = colorize_alert(surge, "价格上涨 1.00% | 100 → 101")
+    change = f"{SURGE_CHANGE_COLOR}1.00%{Style.RESET_ALL}{Fore.GREEN}"
+    assert text == f"{Fore.GREEN}价格上涨 {change} | 100 → 101{Style.RESET_ALL}"
+
+    # 急跌时 change_percent 为负，文本中显示绝对值，着色也要匹配到绝对值。
+    drop = replace(make_alert(), direction="drop", price=99.0, change_percent=-1.0)
+    text = colorize_alert(drop, "价格下跌 1.00% | 100 → 99")
+    change = f"{DROP_CHANGE_COLOR}1.00%{Style.RESET_ALL}{Fore.RED}"
+    assert text == f"{Fore.RED}价格下跌 {change} | 100 → 99{Style.RESET_ALL}"
 
 
 def make_alert(symbol: str = "BTC_USDT") -> PriceAlert:
@@ -192,7 +219,7 @@ def test_console_notifier_keeps_terminal_bell_off_macos(monkeypatch, capsys):
 
     asyncio.run(ConsoleNotifier(beep=True, colors=False).send(make_alert()))
 
-    assert capsys.readouterr().out.startswith("\a[暴涨提醒]")
+    assert capsys.readouterr().out.startswith("\a[急涨提醒]")
 
 
 def test_macos_sound_failure_does_not_hide_alert(monkeypatch, capsys, caplog):
@@ -209,7 +236,7 @@ def test_macos_sound_failure_does_not_hide_alert(monkeypatch, capsys, caplog):
 
     asyncio.run(scenario())
 
-    assert "[暴涨提醒]" in capsys.readouterr().out
+    assert "[急涨提醒]" in capsys.readouterr().out
     assert "macOS 提示音播放失败" in caplog.text
 
 

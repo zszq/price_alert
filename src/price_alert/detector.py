@@ -374,7 +374,7 @@ class AtrMoveDetector:
         direction: Literal["surge", "drop"],
     ) -> bool:
         price_move = latest_price - baseline_price
-        # 反向必须单独判断：仅看幅度的话，暴涨过后直接砸穿基准价也能满足门槛而发出暴涨提醒。
+        # 反向必须单独判断：仅看幅度的话，急涨过后直接砸穿基准价也能满足门槛而发出急涨提醒。
         if (price_move > 0) != (direction == "surge"):
             return False
         return self._exceeds_thresholds(price_move, baseline_price, atr)

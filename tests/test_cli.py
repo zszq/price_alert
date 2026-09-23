@@ -20,7 +20,7 @@ def test_simulate_produces_one_alert_for_valid_configurations(indicator, capsys)
     config = AppConfig.model_validate({"indicator": indicator, "alerts": {"console_colors": False}})
 
     assert asyncio.run(cli.simulate(config)) == 1
-    assert "暴涨提醒" in capsys.readouterr().out
+    assert "急涨提醒" in capsys.readouterr().out
 
 
 def test_missing_config_file_exits_with_readable_message(tmp_path):

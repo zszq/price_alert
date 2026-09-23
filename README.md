@@ -93,10 +93,13 @@ Windows 可以双击 `start-monitor.bat`，或者运行：
 ## 提醒示例
 
 ```text
-[暴涨提醒] 2026-09-16 16:20:30 | BTC_USDT | 30秒内价格上涨 1.24% | 75800 → 76739.92 | 异动强度 2.84 ATR
+[急涨提醒] 2026-09-16 16:20:30 | BTC_USDT | 30秒内价格上涨 1.24% | 75800 → 76739.92 | 异动强度 2.84 ATR
+交易地址：https://www.gate.com/zh/futures/USDT/BTC_USDT
 ```
 
-提醒时间使用北京时间，格式为 `YYYY-MM-DD HH:MM:SS`。控制台中暴涨提醒显示为绿色，暴跌提醒显示为红色；`alerts.beep` 开启时，macOS 使用系统 `Glass` 音效，其他平台使用终端响铃。文本明确显示价格涨跌百分比，不显示原始 ATR 数值和 24 小时成交额。JSONL 和 Webhook 记录仍保留完整结构化字段，并包含值为 `green` 或 `red` 的 `color` 字段。
+提醒时间使用北京时间，格式为 `YYYY-MM-DD HH:MM:SS`。控制台中急涨提醒显示为绿色，急跌提醒显示为红色，交易对以亮黄色突出，涨跌幅百分比以同方向的亮绿/亮红色突出；`alerts.beep` 开启时，macOS 使用系统 `Glass` 音效，其他平台使用终端响铃。文本明确显示价格涨跌百分比，不显示原始 ATR 数值和 24 小时成交额。JSONL 和 Webhook 记录仍保留完整结构化字段，并包含值为 `green` 或 `red` 的 `color` 字段。
+
+控制台每条提醒下方会显示对应合约的 Gate 中文交易页完整地址。支持网址识别的终端可点击打开（部分终端需要按住 `Ctrl` 或 `Cmd` 再点击）；不支持时可复制到浏览器打开。交易地址仅附加在控制台输出中。
 
 实时提醒默认追加到 `data/alerts/alerts.jsonl`。每行是一条完整 JSON，即使程序异常退出，也不会破坏之前的记录。文件超过 `alerts.jsonl_max_bytes` 后整体轮转为 `alerts.jsonl.1`、`alerts.jsonl.2` 等，最多保留 `alerts.jsonl_backup_count` 个历史文件。
 
@@ -116,10 +119,13 @@ $env:PRICE_ALERT_WEBHOOK_URL = "https://example.com/your-webhook"
 `config/default.yaml` 的主要参数：
 
 - `gate.min_volume_24h_quote`：24 小时 USDT 计价成交额门槛；
-- `gate.universe_exit_volume_ratio`：已在监控中的合约的退出门槛比例，成交额低于 `min_volume_24h_quote × 该比例` 才移除，默认 0.8；
+- `gate.universe_exit_volume_ratio`：已在监控中的合约的退出门槛比例，成交额低于或等于 `min_volume_24h_quote × 该比例` 即移除（准入与退出都是严格大于门槛才保留），默认 0.8；
 - `gate.universe_refresh_seconds`：交易对池刷新周期；
 - `gate.reconnect_initial_seconds` / `gate.reconnect_max_seconds`：断线重连的指数退避初始值与上限，上限不能小于初始值；
 - `gate.max_data_lag_seconds`：实时成交的最大允许滞后，默认 10 秒。网络拥塞时成交会在链路上积压，推送过来的已是几十秒前的行情，此时秒级判定失去意义；逐笔校验成交时间戳，超过该值即主动断开重连以清空积压，滞后的成交在判定之前就被拦下，不会产生提醒。若日志频繁出现「行情数据滞后」，说明到 Gate 的网络链路不稳，应先排查网络而不是调高该值；
+- `gate.rest_rate_limit_per_second` / `gate.rest_rate_limit_burst`：所有 REST 请求共用的令牌桶速率与突发额度，默认 10 次/秒、突发 20 次。交易所限频按单位时间的请求数计算，而合约池大小只决定单轮请求数，因此上限必须加在时间维度上：合约池再大、断线重连再频繁，长期平均速率都收敛到该值，只会拉长一轮预热或回补的耗时。注意突发额度是瞬时放行的额度——桶攒满时可以一次发出 20 个请求，限制的是长期平均速率而非任意一秒内的绝对上限，所以突发额度不应超过交易所在一个限频窗口内的配额——Gate 公共接口的官方口径是每个端点每 10 秒 200 次（响应头 `X-Gate-RateLimit-Limit` 实测同为 200），折合平均 20 次/秒，而本项目的令牌桶是所有端点共用的，比按端点计算更保守。若日志出现 429，应下调速率而不是调高重试次数；
+- `gate.rest_retries`：单个请求的最大尝试次数。429 按交易所告知的恢复时刻等待（封顶 30 秒）：优先读 HTTP 标准头 `Retry-After`，Gate 实际不返回该头，恢复时刻放在专有头 `X-Gate-RateLimit-Reset-Timestamp`（Unix 秒级绝对时间戳）里；两者都没有时才按 2 秒起的指数退避，明显长于其他临时故障的 0.5 秒，避免在限频期间继续加码请求；
+- `gate.warmup_concurrency`：ATR 预热与断线回补共用的并发上限，两者共用同一个信号量，峰值并发不会叠加；
 - `indicator.candle_interval`：ATR K 线周期；
 - `indicator.atr_period`：Wilder ATR 周期；
 - `indicator.lookback_seconds`：短时位移观察窗口；

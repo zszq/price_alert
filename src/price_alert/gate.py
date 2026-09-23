@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import email.utils
 import http.client
 import itertools
 import json
 import logging
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -23,6 +25,89 @@ LOGGER = logging.getLogger(__name__)
 
 # 只有限频和服务端临时故障值得重试；其余 4xx 多为参数或合约不存在，重试只会拖慢预热。
 RETRYABLE_HTTP_STATUS = frozenset({408, 429, 500, 502, 503, 504})
+# 普通临时故障的退避基数；限频恢复通常以秒计，用同一个基数会过早重试，所以 429 单独用下面的基数。
+RETRY_BACKOFF_SECONDS = 0.5
+RATE_LIMITED_BACKOFF_SECONDS = 2.0
+# 退避时长由交易所控制，异常大的值会让线程长期占着不放并拖住整轮预热，必须封顶。
+MAX_RETRY_AFTER_SECONDS = 30.0
+# Gate 不返回标准的 Retry-After，限频恢复时刻放在这个专有头里（Unix 秒级绝对时间戳）。
+RATE_LIMIT_RESET_HEADER = "X-Gate-RateLimit-Reset-Timestamp"
+
+
+class RateLimiter:
+    """令牌桶，给所有 REST 出口统一限速。
+
+    限频按单位时间的请求数计算，而合约池大小只决定单轮请求数，所以并发信号量挡不住重连风暴这类
+    "轮数多"的场景——真正的上限必须加在时间维度上，由这里统一承担。
+
+    REST 客户端是同步实现、经 asyncio.to_thread 在多个线程中并发调用，因此用 threading 原语而
+    不是 asyncio 原语。
+    """
+
+    def __init__(self, rate_per_second: float, burst: int | None = None) -> None:
+        if rate_per_second <= 0:
+            raise ValueError("rate_per_second 必须大于 0")
+        self.rate_per_second = float(rate_per_second)
+        self.burst = float(burst) if burst is not None else max(1.0, float(rate_per_second))
+        self._tokens = self.burst
+        self._updated = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        with self._lock:
+            now = time.monotonic()
+            self._tokens = min(self.burst, self._tokens + (now - self._updated) * self.rate_per_second)
+            self._updated = now
+            if self._tokens >= 1.0:
+                self._tokens -= 1.0
+                return
+            wait = (1.0 - self._tokens) / self.rate_per_second
+            self._tokens = 0.0
+            # 把等待时长预支进 _updated：后续线程读到的是"欠账"状态，于是依次排到更晚的时刻，
+            # 而不是全部睡同样长再一起醒来抢同一个令牌。
+            self._updated = now + wait
+        # sleep 必须在锁外，否则等待的线程会连带堵住其他线程取令牌。
+        time.sleep(wait)
+
+
+def _rate_limit_reset_seconds(headers: Any) -> float | None:
+    """解析 Gate 专有的限频重置头，换算成还需等待的秒数。"""
+    raw = headers.get(RATE_LIMIT_RESET_HEADER) if headers is not None else None
+    if not raw:
+        return None
+    try:
+        reset_at = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if reset_at != reset_at:  # NaN 能通过解析，但比较运算全为假，会绕过下面的封顶
+        return None
+    # 头里是绝对时间戳，必须与本地时钟相减。本地时钟快于交易所时差值偏小甚至为负，会过早重试；
+    # 但限速器对重试同样收令牌，最短也隔着 1/rate 秒，不会退化成无间隔重试。
+    return min(max(reset_at - datetime.now(UTC).timestamp(), 0.0), MAX_RETRY_AFTER_SECONDS)
+
+
+def _retry_after_seconds(headers: Any) -> float | None:
+    """解析 Retry-After（秒数或 HTTP-date 两种合法格式），无法识别时返回 None。"""
+    raw = headers.get("Retry-After") if headers is not None else None
+    if not raw:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        try:
+            parsed = email.utils.parsedate_to_datetime(str(raw))
+        except (TypeError, ValueError):
+            return None
+        if parsed is None:
+            return None
+        # -0000 表示时区未知，解析结果是 naive datetime，直接与 aware 的当前时间相减会抛
+        # TypeError 并中断整个请求。按规范这种情况等同 GMT，补上 UTC 即可。
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        seconds = (parsed - datetime.now(UTC)).total_seconds()
+    if seconds != seconds:  # NaN：float("nan") 能通过上面的解析，但比较运算全为假，会绕过封顶
+        return None
+    return min(max(seconds, 0.0), MAX_RETRY_AFTER_SECONDS)
 
 
 class _ThrottledLogger:
@@ -55,11 +140,13 @@ class GateRestClient:
         settle: str = "usdt",
         timeout_seconds: float = 15.0,
         retries: int = 3,
+        rate_limiter: RateLimiter | None = None,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.settle = settle
         self.timeout_seconds = timeout_seconds
         self.retries = retries
+        self.rate_limiter = rate_limiter
 
     def fetch_tickers(self) -> list[dict[str, Any]]:
         payload = self._get(f"/futures/{self.settle}/tickers")
@@ -91,6 +178,9 @@ class GateRestClient:
         )
         for attempt in range(self.retries):
             is_last_attempt = attempt == self.retries - 1
+            if self.rate_limiter is not None:
+                # 重试同样要取令牌：否则被限频后的重试会绕过限速，正好在最该收敛的时刻加码请求。
+                self.rate_limiter.acquire()
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:  # noqa: S310
                     return json.loads(response.read().decode("utf-8"))
@@ -98,12 +188,26 @@ class GateRestClient:
                 # HTTPError 是 OSError 子类，必须先于下方分支处理，否则不可恢复的 4xx 也会被重试。
                 if exc.code not in RETRYABLE_HTTP_STATUS or is_last_attempt:
                     raise
+                delay = self._retry_delay(attempt, exc)
             except (OSError, http.client.HTTPException, json.JSONDecodeError):
                 # 读响应体时的连接重置、截断和维护页等临时故障不会被包装成 URLError，需要单独纳入重试。
                 if is_last_attempt:
                     raise
-            time.sleep(0.5 * (2**attempt))
+                delay = RETRY_BACKOFF_SECONDS * (2**attempt)
+            time.sleep(delay)
         raise RuntimeError("Gate REST 重试状态异常")
+
+    def _retry_delay(self, attempt: int, exc: urllib.error.HTTPError) -> float:
+        if exc.code != 429:
+            return RETRY_BACKOFF_SECONDS * (2**attempt)
+        # 交易所明确告知还要等多久时以它为准，自行退避只会提前重试、继续踩在限频上。
+        # 先认 HTTP 标准头：Gate 目前只发下面的专有头，但标准头若出现则语义更权威。
+        for parse in (_retry_after_seconds, _rate_limit_reset_seconds):
+            delay = parse(exc.headers)
+            if delay is not None:
+                return delay
+        # 两个头都没有才盲目退避：等多久全靠猜，限频窗口未重置就会连续撞满重试次数。
+        return RATE_LIMITED_BACKOFF_SECONDS * (2**attempt)
 
 
 def parse_candle(payload: Mapping[str, Any]) -> Candle:

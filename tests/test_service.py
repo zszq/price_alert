@@ -28,6 +28,11 @@ def record_sleeps(monkeypatch, limit: int) -> list[float]:
     return delays
 
 
+def semaphore() -> asyncio.Semaphore:
+    """生产代码里两个循环共用一个信号量，测试各用例独立构造即可。"""
+    return asyncio.Semaphore(8)
+
+
 def config() -> AppConfig:
     return AppConfig.model_validate(
         {"gate": {"reconnect_initial_seconds": 1, "reconnect_max_seconds": 4, "universe_refresh_seconds": 600}}
@@ -91,7 +96,7 @@ def test_network_timeouts_use_backoff_mark_gap_and_resync_only_while_connected(m
     resync_started: list[int] = []
     resync_cancelled: list[int] = []
 
-    async def fake_resync(detector, rest, config):
+    async def fake_resync(detector, rest, config, _semaphore):
         resync_started.append(len(resync_started))
         try:
             await asyncio.get_running_loop().create_future()
@@ -111,7 +116,7 @@ def test_network_timeouts_use_backoff_mark_gap_and_resync_only_while_connected(m
     )
 
     with pytest.raises(StopLoop):
-        asyncio.run(service._stream_loop(detector, feed, object(), dispatcher, config()))
+        asyncio.run(service._stream_loop(detector, feed, object(), dispatcher, config(), semaphore()))
 
     # 第二次连接收到成交后退避重置为初始值。
     assert delays == [1, 1, 2]
@@ -136,7 +141,7 @@ def test_first_stale_tick_breaks_before_publishing(monkeypatch, caplog):
     feed = ScriptedFeed([(("1", "2"), ConnectionError("unused"))], lag_seconds=30)
 
     with pytest.raises(StopLoop):
-        asyncio.run(service._stream_loop(detector, feed, object(), dispatcher, config()))
+        asyncio.run(service._stream_loop(detector, feed, object(), dispatcher, config(), semaphore()))
 
     assert "行情数据滞后" in caplog.text
     assert "30.0 秒" in caplog.text
@@ -155,7 +160,7 @@ def test_backlog_burst_within_one_second_is_not_let_through(monkeypatch):
     feed = ScriptedFeed([(tuple(str(i) for i in range(50)), ConnectionError("unused"))], lag_seconds=30)
 
     with pytest.raises(StopLoop):
-        asyncio.run(service._stream_loop(detector, feed, object(), dispatcher, config()))
+        asyncio.run(service._stream_loop(detector, feed, object(), dispatcher, config(), semaphore()))
 
     assert dispatcher.published == []
 
@@ -173,7 +178,7 @@ def test_persistent_lag_keeps_backing_off(monkeypatch, caplog):
     feed = ScriptedFeed([(("1",), ConnectionError("unused"))] * 3, lag_seconds=30)
 
     with pytest.raises(StopLoop):
-        asyncio.run(service._stream_loop(detector, feed, object(), dispatcher, config()))
+        asyncio.run(service._stream_loop(detector, feed, object(), dispatcher, config(), semaphore()))
 
     # 一直没有可用行情，不应报出“连接成功”。
     assert "连接成功" not in caplog.text
@@ -187,7 +192,7 @@ def test_fresh_market_data_does_not_trigger_lag_breaker(monkeypatch):
     feed = ScriptedFeed([(("1", "2", "3"), ConnectionError("down"))], lag_seconds=0)
 
     with pytest.raises(StopLoop):
-        asyncio.run(service._stream_loop(detector, feed, object(), dispatcher, config()))
+        asyncio.run(service._stream_loop(detector, feed, object(), dispatcher, config(), semaphore()))
 
     assert dispatcher.published == ["alert-1", "alert-2", "alert-3"]
 
@@ -230,14 +235,14 @@ def test_refresh_warms_new_symbols_keeps_hysteresis_and_updates_feed_without_rec
             [ticker("BTC_USDT", 20e6), ticker("ETH_USDT", 20e6)],
             [contract("BTC_USDT"), contract("ETH_USDT")],
         )
-        await service._refresh_universe(detector, first, feed, app_config)
+        await service._refresh_universe(detector, first, feed, app_config, semaphore())
 
         # ETH 成交额回落到门槛与退出门槛之间应保留，BTC 跌破退出门槛被移除，SOL 新入池需要预热。
         second = FakeRest(
             [ticker("BTC_USDT", 5e6), ticker("ETH_USDT", 9e6), ticker("SOL_USDT", 20e6)],
             [contract("BTC_USDT"), contract("ETH_USDT"), contract("SOL_USDT")],
         )
-        await service._refresh_universe(detector, second, feed, app_config)
+        await service._refresh_universe(detector, second, feed, app_config, semaphore())
         return detector, feed, first, second
 
     detector, feed, first, second = asyncio.run(scenario())
@@ -267,7 +272,7 @@ def test_universe_loop_keeps_running_after_refresh_failure(monkeypatch):
     feed = GateTradeFeed("wss://example.test")
 
     with pytest.raises(StopLoop):
-        asyncio.run(service._universe_loop(detector, rest, feed, app_config))
+        asyncio.run(service._universe_loop(detector, rest, feed, app_config, semaphore()))
 
     assert delays == [600, 60, 600]
     assert detector.symbols == ["BTC_USDT"]
@@ -280,7 +285,7 @@ def test_initial_universe_retries_with_backoff(monkeypatch):
     rest = FakeRest([ticker("BTC_USDT", 20e6)], [contract("BTC_USDT")], fail_times=4)
     feed = GateTradeFeed("wss://example.test")
 
-    asyncio.run(service._initial_universe(detector, rest, feed, app_config))
+    asyncio.run(service._initial_universe(detector, rest, feed, app_config, semaphore()))
 
     assert delays == [1, 2, 4, 4]
     assert feed.symbols == ["BTC_USDT"]
@@ -316,7 +321,7 @@ def test_resync_rebuilds_stale_symbols_and_retries_failures(monkeypatch):
     detector.mark_stream_gap()
     rest = CandleRest(candles, failures={"ETH_USDT": 1})
 
-    asyncio.run(service._resync_stale_symbols(detector, rest, app_config))
+    asyncio.run(service._resync_stale_symbols(detector, rest, app_config, semaphore()))
 
     assert detector.stale_symbols == []
     # 第一轮 ETH 失败，只按退避重试仍然失效的合约。
@@ -331,7 +336,7 @@ def test_symbols_added_during_disconnect_are_resynced_after_reconnect(monkeypatc
     detector.add_symbol("BTC_USDT", [], 1e9)
     resynced_batches: list[list[str]] = []
 
-    async def fake_resync(detector, rest, config):
+    async def fake_resync(detector, rest, config, _semaphore):
         resynced_batches.append(detector.stale_symbols)
 
     class AddsSymbolWhileDisconnected(ScriptedFeed):
@@ -346,6 +351,64 @@ def test_symbols_added_during_disconnect_are_resynced_after_reconnect(monkeypatc
     feed = AddsSymbolWhileDisconnected([((), ConnectionError("down")), (("1",), ConnectionError("down again"))])
 
     with pytest.raises(StopLoop):
-        asyncio.run(service._stream_loop(detector, feed, object(), FakeDispatcher(), app_config))
+        asyncio.run(service._stream_loop(detector, feed, object(), FakeDispatcher(), app_config, semaphore()))
 
     assert resynced_batches == [["BTC_USDT", "NEW_USDT"]]
+
+
+class TrackingSemaphore:
+    """记录并发峰值的信号量替身，用于确认回补走的是外部传入的那一个。"""
+
+    def __init__(self, limit: int) -> None:
+        self._inner = asyncio.Semaphore(limit)
+        self.active = 0
+        self.peak = 0
+
+    async def __aenter__(self) -> None:
+        await self._inner.acquire()
+        self.active += 1
+        self.peak = max(self.peak, self.active)
+
+    async def __aexit__(self, *exc_info) -> None:
+        self.active -= 1
+        self._inner.release()
+
+
+def test_resync_limits_concurrency_with_the_shared_semaphore():
+    """回补若自建信号量，与合约池刷新并行时峰值并发会翻倍，限速也就失去了唯一的收口。"""
+    app_config = config()
+    detector = service.build_detector(app_config)
+    now = datetime.now(UTC)
+    candles = [
+        Candle(now - timedelta(minutes=offset), 100, 101, 99, 100)
+        for offset in range(app_config.indicator.warmup_candles, -1, -1)
+    ]
+    for symbol in ("BTC_USDT", "ETH_USDT", "SOL_USDT", "XRP_USDT"):
+        detector.add_symbol(symbol, [], 1e9)
+    detector.mark_stream_gap()
+    rest = CandleRest(candles)
+    tracker = TrackingSemaphore(2)
+
+    asyncio.run(service._resync_stale_symbols(detector, rest, app_config, tracker))
+
+    assert detector.stale_symbols == []
+    # peak 为 0 说明传入的信号量根本没被用到（即代码又在内部自建了一个）。
+    assert 0 < tracker.peak <= 2
+
+
+def test_sync_universe_uses_the_shared_semaphore():
+    async def scenario():
+        app_config = config()
+        detector = service.build_detector(app_config)
+        feed = GateTradeFeed("wss://example.test")
+        rest = FakeRest(
+            [ticker(symbol, 20e6) for symbol in ("BTC_USDT", "ETH_USDT", "SOL_USDT")],
+            [contract(symbol) for symbol in ("BTC_USDT", "ETH_USDT", "SOL_USDT")],
+        )
+        tracker = TrackingSemaphore(2)
+        await service._refresh_universe(detector, rest, feed, app_config, tracker)
+        return tracker
+
+    tracker = asyncio.run(scenario())
+
+    assert 0 < tracker.peak <= 2

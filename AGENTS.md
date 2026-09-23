@@ -58,7 +58,8 @@ python -m venv .venv
 
 - pydantic 模型全部 `extra="forbid"`，YAML 中出现未知键会直接报错。
 - `PRICE_ALERT_WEBHOOK_URL` 环境变量覆盖 `alerts.webhook_url`。
-- 代码默认值与 `config/default.yaml` 必须保持一致，并由配置测试校验；实际运行仍以 YAML 为准。
+- `config.py` 中的代码默认值固定不变，没有特别要求不要改；它只在 YAML 缺少对应项时生效，实际运行以 YAML 为准。
+- `config/default.yaml` 每项注释中的「默认 X」标注的是代码默认值。调参时只改 YAML 的取值，注释里的默认值和 `config.py` 都不动，两者允许不一致；配置测试只校验 YAML 能通过校验。
 - `IndicatorConfig` 校验：`warmup_candles > atr_period`、`confirmation_seconds ≤ lookback_seconds`、`max_atr_age_seconds ≥ 2 个 K 线周期`（未显式设置时自动取 3 个周期）。`GateConfig` 校验 `reconnect_max_seconds ≥ reconnect_initial_seconds`。
 
 ### 新增/修改检测参数时需要同步的位置
@@ -71,7 +72,7 @@ python -m venv .venv
 
 ### 通知（notifier.py）
 
-`AlertDispatcher` 为每个通道建立独立的有界队列（`alerts.queue_size`）和后台任务：`publish` 非阻塞，队列满时丢弃并记错误日志；单个通道失败只记日志；退出时最多等待 `drain_timeout` 秒把积压发完。`build_notifiers` 按配置返回通道列表。`JsonlNotifier` 按 `jsonl_max_bytes` 整文件轮转。提醒时间统一转为北京时间；控制台暴涨绿色、暴跌红色；JSONL/Webhook 保留完整结构化字段（`PriceAlert.to_dict()`）。修改提醒文本格式时注意 README 中的示例。
+`AlertDispatcher` 为每个通道建立独立的有界队列（`alerts.queue_size`）和后台任务：`publish` 非阻塞，队列满时丢弃并记错误日志；单个通道失败只记日志；退出时最多等待 `drain_timeout` 秒把积压发完。`build_notifiers` 按配置返回通道列表。`JsonlNotifier` 按 `jsonl_max_bytes` 整文件轮转。提醒时间统一转为北京时间；控制台急涨绿色、急跌红色；JSONL/Webhook 保留完整结构化字段（`PriceAlert.to_dict()`）。修改提醒文本格式时注意 README 中的示例。
 
 ## 约定
 
