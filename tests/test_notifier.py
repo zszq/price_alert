@@ -326,3 +326,27 @@ def test_jsonl_notifier_rotates_whole_files(tmp_path):
     assert symbols(tmp_path / "alerts.jsonl.1") == ["C_USDT"]
     assert symbols(tmp_path / "alerts.jsonl.2") == ["B_USDT"]
     assert not (tmp_path / "alerts.jsonl.3").exists()
+
+
+def test_console_trade_url_keeps_chinese_symbol_readable(monkeypatch, capsys):
+    monkeypatch.setattr("price_alert.notifier.sys.platform", "linux")
+
+    asyncio.run(ConsoleNotifier(beep=False, colors=False).send(make_alert(symbol="龙虾_USDT")))
+
+    assert "交易地址：https://www.gate.com/zh/futures/USDT/龙虾_USDT\n" in capsys.readouterr().out
+
+
+def test_console_trade_url_still_escapes_ascii_reserved_characters(monkeypatch, capsys):
+    monkeypatch.setattr("price_alert.notifier.sys.platform", "linux")
+
+    asyncio.run(ConsoleNotifier(beep=False, colors=False).send(make_alert(symbol="A/B?_USDT")))
+
+    assert "/futures/USDT/A%2FB%3F_USDT\n" in capsys.readouterr().out
+
+
+def test_console_trade_url_escapes_non_ascii_whitespace_and_invisible_characters(monkeypatch, capsys):
+    monkeypatch.setattr("price_alert.notifier.sys.platform", "linux")
+
+    asyncio.run(ConsoleNotifier(beep=False, colors=False).send(make_alert(symbol="龙\u3000虾\u200b_USDT")))
+
+    assert "/futures/USDT/龙%E3%80%80虾%E2%80%8B_USDT\n" in capsys.readouterr().out

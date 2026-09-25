@@ -64,6 +64,15 @@ def colorize_alert(alert: PriceAlert, text: str, enabled: bool = True) -> str:
     return f"{color}{text}{Style.RESET_ALL}"
 
 
+def _url_path_segment(symbol: str) -> str:
+    # 中文等非 ASCII 字符原样保留，否则地址显示成一串 %XX 难以辨认；浏览器打开时会自行编码。
+    # ASCII 保留字符（/、?、# 等）会破坏路径结构，非 ASCII 的空白和不可见字符会截断终端的链接识别，仍需编码。
+    return "".join(
+        char if not char.isascii() and char.isprintable() and not char.isspace() else quote(char, safe="")
+        for char in symbol
+    )
+
+
 class ConsoleNotifier:
     def __init__(self, beep: bool = True, colors: bool = True) -> None:
         self.beep = beep
@@ -79,7 +88,7 @@ class ConsoleNotifier:
     async def send(self, alert: PriceAlert) -> None:
         text = colorize_alert(alert, format_alert(alert), self.colors)
         # 完整网址独占一行且不着色，便于终端自动识别链接，不支持点击时也能直接复制。
-        trade_url = f"https://www.gate.com/zh/futures/USDT/{quote(alert.symbol, safe='')}"
+        trade_url = f"https://www.gate.com/zh/futures/USDT/{_url_path_segment(alert.symbol)}"
         terminal_bell = "\a" if self.beep and not self._system_sound else ""
         print(f"{terminal_bell}{text}\n交易地址：{trade_url}", flush=True)
         # 音效约 1.65 秒，等待播完会让集中异动时的文字提醒逐条排队延迟，所以放到后台；
